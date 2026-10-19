@@ -75,8 +75,9 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
         if saldo_f is not None: prev_saldo = saldo_f
     return pd.DataFrame(rows)
 
+
 # ==========================================
-# PARSER BCA (Versi 9.0 - Koordinat X,Y)
+# PARSER BCA (KOORDINAT & PERBAIKAN DEBIT/KREDIT)
 # ==========================================
 def parse_bca_coordinates(file_obj, password=None):
     transactions = []
@@ -89,19 +90,16 @@ def parse_bca_coordinates(file_obj, password=None):
         if match_thn: tahun = match_thn.group(1)
 
         for page in pdf.pages:
-            # 1. Potong area tabel (abaikan header & footer)
-            # Kita cari kata "TANGGAL" dan "SALDO" untuk batas atas tabel
             words = page.extract_words()
             
-            # Cari batas Y untuk mulai membaca (di bawah kata TANGGAL)
+            # Cari batas Y (bawah header tabel)
             start_y = 0
             for w in words:
                 if "TANGGAL" in w['text'].upper():
                     start_y = w['bottom'] + 5
                     break
             
-            # Cari batas X untuk memisahkan kolom Mutasi dan Saldo
-            # Saldo biasanya ada di X yang paling kanan (di atas 80% lebar halaman)
+            # Bagi halaman menjadi 3 zona X
             page_width = page.width
             x_split_saldo = page_width * 0.75 
             x_split_mutasi = page_width * 0.65
@@ -110,22 +108,18 @@ def parse_bca_coordinates(file_obj, password=None):
             lines = {}
             for w in words:
                 if w['top'] < start_y: continue
-                
-                # Bulatkan Y agar kata yang sejajar dianggap satu baris
                 y_key = round(w['top'] / 5) * 5 
                 if y_key not in lines:
                     lines[y_key] = []
                 lines[y_key].append(w)
 
-            # Proses per baris
+            # Proses per baris dari atas ke bawah
             for y, word_list in sorted(lines.items()):
-                # Urutkan berdasarkan X (kiri ke kanan)
                 word_list.sort(key=lambda w: w['x0'])
                 
-                # Gabungkan teks berdasarkan posisi X
-                text_kiri = "" # Tanggal & Keterangan
-                text_tengah = "" # Mutasi
-                text_kanan = "" # Saldo
+                text_kiri = ""
+                text_tengah = ""
+                text_kanan = ""
                 
                 for w in word_list:
                     if w['x0'] < x_split_mutasi:
@@ -135,11 +129,10 @@ def parse_bca_coordinates(file_obj, password=None):
                     else:
                         text_kanan += w['text'] + " "
                 
-                # Cek apakah baris ini transaksi baru (diawali DD/MM)
+                # Apakah baris ini tanggal transaksi baru?
                 match = re.match(r"^(\d{2}/\d{2})(.*)", text_kiri.strip())
                 
                 if match:
-                    # Jika ada transaksi baru, simpan transaksi sebelumnya
                     if 'current_txn' in locals() and current_txn is not None:
                         transactions.append(current_txn)
                     
@@ -150,7 +143,6 @@ def parse_bca_coordinates(file_obj, password=None):
                         current_txn = None
                         continue
                         
-                    # Bersihkan keterangan dari spasi berlebih
                     desc = " ".join(desc.split())
                     
                     current_txn = {
@@ -162,35 +154,33 @@ def parse_bca_coordinates(file_obj, password=None):
                         "Saldo": None
                     }
                     
-                    # Ekstrak Angka dari text_tengah dan text_kanan
-                    # (Bisa jadi angka mutasi nyangkut ke kiri jika jaraknya dekat)
                     all_angka_mutasi = text_tengah + text_kiri
                     
-                    # Cari Saldo (biasanya di text_kanan)
+                    # Cari Saldo di kolom kanan
                     match_saldo = re.search(r"(-?\d{1,3}(?:[,.]\d{3})*\.\d{2})", text_kanan)
                     if match_saldo:
                         current_txn["Saldo"] = to_float_indo_bca(match_saldo.group(1))
                     
-                    # Cari Mutasi
+                    # Cari Nominal Mutasi
                     match_mutasi = re.search(r"(\d{1,3}(?:[,.]\d{3})*\.\d{2})", all_angka_mutasi)
                     if match_mutasi:
                         nominal = to_float_indo_bca(match_mutasi.group(1))
+                        
+                        # --- PERBAIKAN: Posisi Debit/Kredit DITUKAR ---
                         if "DB" in text_tengah.upper() or "DB" in text_kiri.upper():
-                            current_txn["Debit"] = nominal
-                        else:
                             current_txn["Kredit"] = nominal
+                        else:
+                            current_txn["Debit"] = nominal
+                        # ----------------------------------------------
                             
-                        # Hapus angka mutasi dari keterangan
                         current_txn["Keterangan"] = current_txn["Keterangan"].replace(match_mutasi.group(1), "")
                             
                 elif current_txn is not None:
-                    # Baris lanjutan (deskripsi)
+                    # Baris lanjutan (teks deskripsi di bawahnya)
                     desc_lanjutan = " ".join(text_kiri.split())
-                    # Buang jika isinya cuma angka desimal (misal 1099000.00)
                     if desc_lanjutan and not re.match(r"^-?\d{1,3}(?:[,.]\d{3})*\.\d{2}$", desc_lanjutan):
                         current_txn["Keterangan"] += " " + desc_lanjutan
 
-        # Simpan transaksi terakhir
         if 'current_txn' in locals() and current_txn is not None:
             transactions.append(current_txn)
             
