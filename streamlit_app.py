@@ -18,7 +18,7 @@ def to_float_indo_mb(s):
 def to_float_indo_bca(s):
     if not s: return None
     try: 
-        # Hapus semua kecuali angka, titik, dan minus
+        # Bersihkan dari karakter selain angka, titik, dan minus
         clean = re.sub(r"[^\d.-]", "", s)
         return float(clean)
     except: return None
@@ -77,9 +77,9 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA (Versi 5.0 - Agresif)
+# PARSER BCA (Versi 6.0 - By Table Lines)
 # ==========================================
-def parse_bca_manual(file_obj, password=None):
+def parse_bca_tables(file_obj, password=None):
     transactions = []
     pdf_args = {"password": password} if password else {}
     
@@ -90,78 +90,78 @@ def parse_bca_manual(file_obj, password=None):
         if match_thn: tahun = match_thn.group(1)
 
         for page in pdf.pages:
-            text = page.extract_text() or ""
-            lines = text.split("\n")
+            # Kembali ke mode "lines" karena PDF BCA punya garis tabel
+            tables = page.extract_tables({
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines"
+            })
             
-            # Gabungkan baris deskripsi yang terpotong
-            merged_lines = []
-            current_line = ""
-            for line in lines:
-                line = line.strip()
-                if not line: continue
-                # Jika baris diawali tanggal DD/MM
-                if re.match(r"^\d{2}/\d{2}", line):
-                    if current_line: merged_lines.append(current_line)
-                    current_line = line
-                else:
-                    if current_line: current_line += " " + line
+            if not tables: continue
             
-            if current_line: merged_lines.append(current_line)
-
-            for line in merged_lines:
-                # Cari baris transaksi
-                match = re.match(r"^(\d{2}/\d{2})(.*)", line)
-                if not match: continue
-                
-                tgl_bulan = match.group(1)
-                content = match.group(2).strip()
-                
-                # Abaikan jika ini baris Saldo Awal atau ringkasan
-                if "SALDO AWAL" in content.upper() or "MUTASI CR" in content.upper():
-                    continue
-                
-                tgl = f"{tgl_bulan}/{tahun}"
-                
-                # EKSTRAKSI ANGKA: Cari pola angka yang diakhiri .xx
-                # Kita pakai regex yang lebih longgar untuk menangkap nomor yang menempel
-                numbers = re.findall(r"(-?\d{1,3}(?:[,.]\d{3})*\.\d{2})", content)
-                
-                debit, kredit, saldo = None, None, None
-                
-                # Ambil angka dari belakang
-                if len(numbers) >= 2:
-                    saldo = to_float_indo_bca(numbers[-1])
-                    nominal = to_float_indo_bca(numbers[-2])
+            for table in tables:
+                for row in table:
+                    # Row biasanya: [Tanggal, Keterangan, CBG, Mutasi, Saldo]
+                    # Bersihkan sel
+                    row = [(str(c).replace("\n", " ").strip() if c else "") for c in row]
                     
-                    # Deteksi Debit (DB)
-                    # Kita cari 'DB' di dekat nominal tersebut
-                    if "DB" in content.upper():
-                        debit = nominal
-                    else:
-                        kredit = nominal
-                        
-                elif len(numbers) == 1:
-                    nominal = to_float_indo_bca(numbers[0])
-                    if "DB" in content.upper(): debit = nominal
-                    else: kredit = nominal
-                
-                # BERSIHKAN KETERANGAN
-                desc = content
-                # Buang semua angka dan 'DB'
-                desc = re.sub(r"(-?\d{1,3}(?:[,.]\d{3})*\.\d{2})", "", desc)
-                desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
-                # Hapus koma/sisa tanda baca dan rapikan spasi
-                desc = " ".join(desc.split()).strip(" ,-")
+                    if len(row) < 4: continue
+                    
+                    # Cari sel yang berisi format tanggal DD/MM
+                    date_idx = -1
+                    for i, cell in enumerate(row):
+                        if re.match(r"^\d{2}/\d{2}$", cell):
+                            date_idx = i
+                            break
+                    
+                    if date_idx == -1: continue
+                    
+                    tgl_bulan = row[date_idx]
+                    keterangan = row[date_idx+1] if len(row) > date_idx+1 else ""
+                    
+                    # Cari kolom mutasi (biasanya ada angka atau teks DB)
+                    mutasi_str = ""
+                    for cell in row:
+                        if re.search(r"\d{1,3}(?:,\d{3})*\.\d{2}", cell) and "DB" in cell.upper():
+                            mutasi_str = cell
+                            break
+                    
+                    # Jika tidak ada DB di kolom mutasi, cari sel yang ada angkanya
+                    if not mutasi_str:
+                        for cell in row:
+                            if re.search(r"\d{1,3}(?:,\d{3})*\.\d{2}", cell):
+                                mutasi_str = cell
+                                break
 
-                transactions.append({
-                    "Tanggal": tgl,
-                    "Kode": "-",
-                    "Keterangan": desc,
-                    "Debit": debit,
-                    "Kredit": kredit,
-                    "Saldo": saldo
-                })
-                
+                    # Cari kolom saldo (biasanya di paling kanan dan ada tanda minus jika minus)
+                    saldo_str = ""
+                    for cell in reversed(row):
+                        if re.search(r"-?\d{1,3}(?:,\d{3})*\.\d{2}", cell):
+                            saldo_str = cell
+                            break
+                    
+                    # Parsing Angka
+                    debit, kredit, saldo = None, None, None
+                    
+                    if mutasi_str:
+                        match_amt = re.search(r"(\d{1,3}(?:,\d{3})*\.\d{2})", mutasi_str)
+                        if match_amt:
+                            nominal = to_float_indo_bca(match_amt.group(1))
+                            if "DB" in mutasi_str.upper(): debit = nominal
+                            else: kredit = nominal
+                            
+                    if saldo_str:
+                        match_saldo = re.search(r"(-?\d{1,3}(?:,\d{3})*\.\d{2})", saldo_str)
+                        if match_saldo:
+                            saldo = to_float_indo_bca(match_saldo.group(1))
+                    
+                    transactions.append({
+                        "Tanggal": f"{tgl_bulan}/{tahun}",
+                        "Kode": "-",
+                        "Keterangan": keterangan,
+                        "Debit": debit,
+                        "Kredit": kredit,
+                        "Saldo": saldo
+                    })
     return transactions
 
 def build_df_bca(transactions, sumber_file):
@@ -220,7 +220,7 @@ if uploaded_files:
                 df = build_df_maybank(txns, uploaded_file.name, saldo_awal)
                 
             elif detected_bank == "BCA":
-                txns = parse_bca_manual(uploaded_file, password=password)
+                txns = parse_bca_tables(uploaded_file, password=password)
                 df = build_df_bca(txns, uploaded_file.name)
             
             if not df.empty:
@@ -247,6 +247,7 @@ if uploaded_files:
         st.download_button(
             label="📥 Download sebagai Excel",
             data=processed_data,
-            file_name="mutasi_gabungan.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            format="xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            file_name="mutasi_gabungan.xlsx"
         )
