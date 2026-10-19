@@ -76,7 +76,7 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA (Versi 7.0 - Smart Line)
+# PARSER BCA (Versi 8.0 - Brute Force)
 # ==========================================
 def parse_bca_smart(file_obj, password=None):
     transactions = []
@@ -88,7 +88,7 @@ def parse_bca_smart(file_obj, password=None):
         match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", page1_text, re.IGNORECASE)
         if match_thn: tahun = match_thn.group(1)
 
-        # Kumpulkan semua baris dari semua halaman
+        # Kumpulkan semua baris
         all_lines = []
         for page in pdf.pages:
             text = page.extract_text() or ""
@@ -101,16 +101,11 @@ def parse_bca_smart(file_obj, password=None):
             line = line.strip()
             if not line: continue
             
-            # Jika baris diawali DD/MM, itu transaksi baru
             if re.match(r"^\d{2}/\d{2}", line):
                 if current_line: merged_lines.append(current_line)
                 current_line = line
             else:
-                # Jika bukan tanggal, gabungkan ke transaksi sebelumnya
-                if current_line:
-                    current_line += " " + line
-                else:
-                    merged_lines.append(line) # Header
+                if current_line: current_line += " " + line
                     
         if current_line: merged_lines.append(current_line)
 
@@ -126,45 +121,47 @@ def parse_bca_smart(file_obj, password=None):
             
             tgl = f"{tgl_bulan}/{tahun}"
             
+            # CARI SEMUA ANGKA desimal .xx di baris ini
+            raw_numbers = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*\.\d{2}", content)
+            
+            # Konversi ke float untuk diurutkan
+            numeric_values = []
+            for num_str in raw_numbers:
+                val = to_float_indo_bca(num_str)
+                if val is not None:
+                    numeric_values.append(val)
+            
             debit, kredit, saldo = None, None, None
-            desc = content
             
-            # CARI ANGKA DARI BELAKANG (Saldo adalah angka terakhir)
-            # Pola angka: desimal pakai titik (contoh: 1,099,000.00)
-            amounts = re.findall(r"-?\d{1,3}(?:,\d{3})*\.\d{2}", content)
-            
-            if amounts:
-                # Ambil angka terakhir sebagai Saldo
-                saldo_str = amounts[-1]
-                saldo = to_float_indo_bca(saldo_str)
+            if len(numeric_values) >= 2:
+                # URUTKAN DARI YANG TERBESAR
+                # Saldo rekening biasanya jauh lebih besar dari nominal transaksi
+                sorted_vals = sorted(numeric_values, reverse=True)
+                saldo = sorted_vals[0] 
+                nominal = sorted_vals[1]
                 
-                # Hapus angka saldo dari teks deskripsi
-                desc = desc.replace(saldo_str, "")
-                
-                # Cek apakah ada nominal mutasi sebelum saldo
-                if len(amounts) >= 2:
-                    nominal_str = amounts[-2]
-                    nominal = to_float_indo_bca(nominal_str)
-                    
-                    # Cek Debit / Kredit
-                    # Biasanya ada teks 'DB' tepat setelah nominal
-                    if "DB" in content.upper():
-                        debit = nominal
-                    else:
-                        kredit = nominal
-                        
-                    desc = desc.replace(nominal_str, "")
-                else:
-                    # Jika hanya ada 1 angka, dan ada 'DB', berarti itu nominal
-                    if "DB" in content.upper():
-                        nominal = to_float_indo_bca(amounts[0])
-                        debit = nominal
-                        desc = desc.replace(amounts[0], "")
-                    else:
-                        # Jika bukan DB, berarti saldo saja (mutasi kosong, jarang terjadi)
-                        pass
+                # Jika ada minus di saldo, kita cek teks aslinya
+                if "-" in content and abs(sorted_vals[-1]) > 0:
+                     # Cari string saldo yang punya minus
+                     for num_str in raw_numbers:
+                         if "-" in num_str:
+                             saldo = to_float_indo_bca(num_str)
+                             break
 
+                if "DB" in content.upper():
+                    debit = nominal
+                else:
+                    kredit = nominal
+                    
+            elif len(numeric_values) == 1:
+                # Hanya ada satu angka, anggap nominal (jarang terjadi)
+                if "DB" in content.upper(): debit = numeric_values[0]
+                else: kredit = numeric_values[0]
+            
             # Bersihkan Keterangan
+            desc = content
+            for num_str in raw_numbers:
+                desc = desc.replace(num_str, "")
             desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
             desc = " ".join(desc.split()).strip(" ,-")
             
