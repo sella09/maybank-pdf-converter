@@ -9,6 +9,24 @@ st.title("🏦 Bank PDF → Excel Converter")
 st.write("Upload PDF Rekening Koran (Maybank / BCA), lalu unduh hasilnya.")
 
 # ==========================================
+# FUNGSI BANTUAN UMUM
+# ==========================================
+def to_float_indo_mb(s):
+    """Konversi format Maybank (1.234.567,89) ke float"""
+    if s is None or s == "": return None
+    try: return float(s.replace(".", "").replace(",", "."))
+    except: return None
+
+def to_float_indo_bca(s):
+    """Konversi format BCA (1,234,567.89) ke float"""
+    if not s: return None
+    try: 
+        clean = s.replace(",", "")
+        return float(clean)
+    except: return None
+
+
+# ==========================================
 # PARSER MAYBANK
 # ==========================================
 AMOUNT_RE_MB = re.compile(r"(?<![\w/])(\d{1,3}(?:\.\d{3})*,\d{2})(?![\w/])")
@@ -23,6 +41,7 @@ def parse_maybank_text(text):
     for line in lines:
         line = line.strip()
         if not line: continue
+        
         date_match = date_pattern.match(line)
         
         if date_match:
@@ -38,13 +57,9 @@ def parse_maybank_text(text):
                 desc = AMOUNT_RE_MB.sub(" ", line).strip() if has_valid else line
                 if desc: current_txn["Keterangan"] += " " + desc
                 if len(current_txn["Nominal"]) < 2 and amounts: current_txn["Nominal"].extend(amounts)
+                
     if current_txn: transactions.append(current_txn)
     return transactions
-
-def to_float_indo(s):
-    if s is None or s == "": return None
-    try: return float(s.replace(".", "").replace(",", "."))
-    except: return None
 
 def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     rows = []
@@ -54,8 +69,8 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
         nominal = amounts[0] if len(amounts) >= 2 else None
         saldo = amounts[1] if len(amounts) >= 2 else (amounts[0] if len(amounts) == 1 else None)
         
-        nominal_f = to_float_indo(nominal)
-        saldo_f = to_float_indo(saldo) if saldo else prev_saldo
+        nominal_f = to_float_indo_mb(nominal)
+        saldo_f = to_float_indo_mb(saldo) if saldo else prev_saldo
         
         debit, kredit = None, None
         if saldo_f is not None and prev_saldo is not None and nominal_f is not None:
@@ -66,19 +81,14 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
         if saldo_f is not None: prev_saldo = saldo_f
     return pd.DataFrame(rows)
 
+
 # ==========================================
 # PARSER BCA
 # ==========================================
-# Regex angka BCA: 1,099,000.00 (pakai koma ribuan, titik desimal)
-AMOUNT_RE_BCA = re.compile(r"(\d{1,3}(?:,\d{3})*\.\d{2})")
-# Regex untuk mencari baris transaksi BCA
-# Tanggal (dd/mm) + Keterangan (semua karakter) + Angka + (DB atau kosong) + Saldo (opsional)
-TXN_RE_BCA = re.compile(r"(\d{2}/\d{2})(.*?)(\d{1,3}(?:,\d{3})*\.\d{2})\s*(DB)?\s*(-?\d{1,3}(?:,\d{3})*\.\d{2})?")
+AMOUNT_RE_BCA = re.compile(r"(-?\d{1,3}(?:,\d{3})*\.\d{2})")
 
 def parse_bca_text(text, tahun="2026"):
-    # Bersihkan text
-    text = text.replace("\n", "")
-    # Ambil tahun dari periode jika ada
+    # Ambil tahun dari periode
     periode_match = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", text, re.IGNORECASE)
     if periode_match: tahun = periode_match.group(1)
     
@@ -87,41 +97,67 @@ def parse_bca_text(text, tahun="2026"):
     saldo_awal = to_float_indo_bca(saldo_awal_match.group(1)) if saldo_awal_match else None
 
     transactions = []
-    # Cari semua kecocokan transaksi
-    for match in TXN_RE_BCA.finditer(text):
-        tgl_bulan, desc_raw, amount_str, is_db, saldo_str = match.groups()
+    
+    # 1. Bersihkan header/footer
+    clean_text = re.sub(r"REKENING GIRO.*?SALDO AWAL", "", text, flags=re.IGNORECASE|re.DOTALL)
+    clean_text = re.sub(r"CATATAN:.*?Rekening ini", "", clean_text, flags=re.IGNORECASE|re.DOTALL)
+    
+    # 2. Pecah teks berdasarkan kemunculan Tanggal (dd/mm)
+    parts = re.split(r"(?=\b\d{2}/\d{2})", clean_text)
+    
+    for part in parts:
+        part = part.strip()
+        if not part: continue
         
-        # Skip jika ini bukan transaksi (misal cuma potongan teks)
-        if not amount_str or "SALDO AWAL" in desc_raw.upper(): continue
+        date_match = re.match(r"^(\d{2}/\d{2})(.*)", part, re.DOTALL)
+        if not date_match: continue
         
-        # Format tanggal
+        tgl_bulan = date_match.group(1)
+        content = date_match.group(2)
+        
         tgl = f"{tgl_bulan}/{tahun}"
         
-        # Bersihkan keterangan
-        desc = desc_raw.strip()
-        # Hapus angka referensi yang menempel di awal keterangan (misal "0408/FTSCY/...")
-        desc = re.sub(r"^\d{4}/[A-Z]+/", "", desc)
+        # Cari semua angka mutasi
+        numbers = AMOUNT_RE_BCA.findall(part)
         
-        # Nominal
-        nominal = to_float_indo_bca(amount_str)
+        nominal_str = None
+        saldo_str = None
         
-        # Debit / Kredit
-        debit = nominal if is_db else None
-        kredit = nominal if not is_db else None
-        
-        # Saldo
+        if len(numbers) >= 2:
+            nominal_str = numbers[-2]
+            saldo_str = numbers[-1]
+        elif len(numbers) == 1:
+            nominal_str = numbers[0]
+            
+        nominal = to_float_indo_bca(nominal_str)
         saldo = to_float_indo_bca(saldo_str) if saldo_str else None
+        
+        # Tentukan Debit/Kredit
+        debit = None
+        kredit = None
+        if nominal is not None:
+            if " DB" in part or "DB " in part or "DB- " in part:
+                debit = nominal
+            else:
+                kredit = nominal
+                
+        # Bersihkan Keterangan
+        desc = part
+        if nominal_str: desc = desc.replace(nominal_str, "")
+        if saldo_str: desc = desc.replace(saldo_str, "")
+        desc = re.sub(r"\bDB\b", "", desc)
+        desc = desc.replace("\n", " ").strip()
         
         transactions.append({
             "Tanggal": tgl,
-            "Kode": "-", # BCA tidak punya kode transaksi seperti Maybank
+            "Kode": "-", 
             "Keterangan": desc,
             "Debit": debit,
             "Kredit": kredit,
             "Saldo": saldo
         })
     
-    # Fallback jika saldo kosong, hitung manual
+    # Fallback saldo jika kosong
     prev_saldo = saldo_awal
     for txn in transactions:
         if txn["Saldo"] is None and prev_saldo is not None:
@@ -132,11 +168,6 @@ def parse_bca_text(text, tahun="2026"):
             prev_saldo = txn["Saldo"]
             
     return transactions
-
-def to_float_indo_bca(s):
-    if not s: return None
-    try: return float(s.replace(",", "").replace(".", ".")) # Karena formatnya 1,099,000.00 (koma ribuan, titik desimal)
-    except: return None
 
 def build_df_bca(transactions, sumber_file):
     rows = []
@@ -151,6 +182,7 @@ def build_df_bca(transactions, sumber_file):
             "Saldo": txn["Saldo"]
         })
     return pd.DataFrame(rows)
+
 
 # ==========================================
 # UI STREAMLIT
@@ -189,7 +221,7 @@ if uploaded_files:
             if detected_bank == "Maybank":
                 saldo_awal = None
                 match = SALDO_AWAL_RE_MB.search(all_text)
-                if match: saldo_awal = to_float_indo(match.group(1))
+                if match: saldo_awal = to_float_indo_mb(match.group(1))
                 txns = parse_maybank_text(all_text)
                 df = build_df_maybank(txns, uploaded_file.name, saldo_awal)
             elif detected_bank == "BCA":
