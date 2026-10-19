@@ -76,9 +76,9 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA (Versi 8.0 - Brute Force)
+# PARSER BCA (Versi 9.0 - Koordinat X,Y)
 # ==========================================
-def parse_bca_smart(file_obj, password=None):
+def parse_bca_coordinates(file_obj, password=None):
     transactions = []
     pdf_args = {"password": password} if password else {}
     
@@ -88,91 +88,111 @@ def parse_bca_smart(file_obj, password=None):
         match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", page1_text, re.IGNORECASE)
         if match_thn: tahun = match_thn.group(1)
 
-        # Kumpulkan semua baris
-        all_lines = []
         for page in pdf.pages:
-            text = page.extract_text() or ""
-            all_lines.extend(text.split("\n"))
+            # 1. Potong area tabel (abaikan header & footer)
+            # Kita cari kata "TANGGAL" dan "SALDO" untuk batas atas tabel
+            words = page.extract_words()
             
-        merged_lines = []
-        current_line = ""
-        
-        for line in all_lines:
-            line = line.strip()
-            if not line: continue
+            # Cari batas Y untuk mulai membaca (di bawah kata TANGGAL)
+            start_y = 0
+            for w in words:
+                if "TANGGAL" in w['text'].upper():
+                    start_y = w['bottom'] + 5
+                    break
             
-            if re.match(r"^\d{2}/\d{2}", line):
-                if current_line: merged_lines.append(current_line)
-                current_line = line
-            else:
-                if current_line: current_line += " " + line
-                    
-        if current_line: merged_lines.append(current_line)
-
-        for line in merged_lines:
-            match = re.match(r"^(\d{2}/\d{2})(.*)", line)
-            if not match: continue
+            # Cari batas X untuk memisahkan kolom Mutasi dan Saldo
+            # Saldo biasanya ada di X yang paling kanan (di atas 80% lebar halaman)
+            page_width = page.width
+            x_split_saldo = page_width * 0.75 
+            x_split_mutasi = page_width * 0.65
             
-            tgl_bulan = match.group(1)
-            content = match.group(2).strip()
-            
-            if "SALDO AWAL" in content.upper() or "MUTASI" in content.upper(): 
-                continue
-            
-            tgl = f"{tgl_bulan}/{tahun}"
-            
-            # CARI SEMUA ANGKA desimal .xx di baris ini
-            raw_numbers = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*\.\d{2}", content)
-            
-            # Konversi ke float untuk diurutkan
-            numeric_values = []
-            for num_str in raw_numbers:
-                val = to_float_indo_bca(num_str)
-                if val is not None:
-                    numeric_values.append(val)
-            
-            debit, kredit, saldo = None, None, None
-            
-            if len(numeric_values) >= 2:
-                # URUTKAN DARI YANG TERBESAR
-                # Saldo rekening biasanya jauh lebih besar dari nominal transaksi
-                sorted_vals = sorted(numeric_values, reverse=True)
-                saldo = sorted_vals[0] 
-                nominal = sorted_vals[1]
+            # Kelompokkan kata berdasarkan baris (Y)
+            lines = {}
+            for w in words:
+                if w['top'] < start_y: continue
                 
-                # Jika ada minus di saldo, kita cek teks aslinya
-                if "-" in content and abs(sorted_vals[-1]) > 0:
-                     # Cari string saldo yang punya minus
-                     for num_str in raw_numbers:
-                         if "-" in num_str:
-                             saldo = to_float_indo_bca(num_str)
-                             break
+                # Bulatkan Y agar kata yang sejajar dianggap satu baris
+                y_key = round(w['top'] / 5) * 5 
+                if y_key not in lines:
+                    lines[y_key] = []
+                lines[y_key].append(w)
 
-                if "DB" in content.upper():
-                    debit = nominal
-                else:
-                    kredit = nominal
+            # Proses per baris
+            for y, word_list in sorted(lines.items()):
+                # Urutkan berdasarkan X (kiri ke kanan)
+                word_list.sort(key=lambda w: w['x0'])
+                
+                # Gabungkan teks berdasarkan posisi X
+                text_kiri = "" # Tanggal & Keterangan
+                text_tengah = "" # Mutasi
+                text_kanan = "" # Saldo
+                
+                for w in word_list:
+                    if w['x0'] < x_split_mutasi:
+                        text_kiri += w['text'] + " "
+                    elif w['x0'] < x_split_saldo:
+                        text_tengah += w['text'] + " "
+                    else:
+                        text_kanan += w['text'] + " "
+                
+                # Cek apakah baris ini transaksi baru (diawali DD/MM)
+                match = re.match(r"^(\d{2}/\d{2})(.*)", text_kiri.strip())
+                
+                if match:
+                    # Jika ada transaksi baru, simpan transaksi sebelumnya
+                    if 'current_txn' in locals() and current_txn is not None:
+                        transactions.append(current_txn)
                     
-            elif len(numeric_values) == 1:
-                # Hanya ada satu angka, anggap nominal (jarang terjadi)
-                if "DB" in content.upper(): debit = numeric_values[0]
-                else: kredit = numeric_values[0]
-            
-            # Bersihkan Keterangan
-            desc = content
-            for num_str in raw_numbers:
-                desc = desc.replace(num_str, "")
-            desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
-            desc = " ".join(desc.split()).strip(" ,-")
-            
-            transactions.append({
-                "Tanggal": tgl,
-                "Kode": "-",
-                "Keterangan": desc,
-                "Debit": debit,
-                "Kredit": kredit,
-                "Saldo": saldo
-            })
+                    tgl_bulan = match.group(1)
+                    desc = match.group(2).strip()
+                    
+                    if "SALDO AWAL" in desc.upper():
+                        current_txn = None
+                        continue
+                        
+                    # Bersihkan keterangan dari spasi berlebih
+                    desc = " ".join(desc.split())
+                    
+                    current_txn = {
+                        "Tanggal": f"{tgl_bulan}/{tahun}",
+                        "Kode": "-",
+                        "Keterangan": desc,
+                        "Debit": None,
+                        "Kredit": None,
+                        "Saldo": None
+                    }
+                    
+                    # Ekstrak Angka dari text_tengah dan text_kanan
+                    # (Bisa jadi angka mutasi nyangkut ke kiri jika jaraknya dekat)
+                    all_angka_mutasi = text_tengah + text_kiri
+                    
+                    # Cari Saldo (biasanya di text_kanan)
+                    match_saldo = re.search(r"(-?\d{1,3}(?:[,.]\d{3})*\.\d{2})", text_kanan)
+                    if match_saldo:
+                        current_txn["Saldo"] = to_float_indo_bca(match_saldo.group(1))
+                    
+                    # Cari Mutasi
+                    match_mutasi = re.search(r"(\d{1,3}(?:[,.]\d{3})*\.\d{2})", all_angka_mutasi)
+                    if match_mutasi:
+                        nominal = to_float_indo_bca(match_mutasi.group(1))
+                        if "DB" in text_tengah.upper() or "DB" in text_kiri.upper():
+                            current_txn["Debit"] = nominal
+                        else:
+                            current_txn["Kredit"] = nominal
+                            
+                        # Hapus angka mutasi dari keterangan
+                        current_txn["Keterangan"] = current_txn["Keterangan"].replace(match_mutasi.group(1), "")
+                            
+                elif current_txn is not None:
+                    # Baris lanjutan (deskripsi)
+                    desc_lanjutan = " ".join(text_kiri.split())
+                    # Buang jika isinya cuma angka desimal (misal 1099000.00)
+                    if desc_lanjutan and not re.match(r"^-?\d{1,3}(?:[,.]\d{3})*\.\d{2}$", desc_lanjutan):
+                        current_txn["Keterangan"] += " " + desc_lanjutan
+
+        # Simpan transaksi terakhir
+        if 'current_txn' in locals() and current_txn is not None:
+            transactions.append(current_txn)
             
     return transactions
 
@@ -232,7 +252,7 @@ if uploaded_files:
                 df = build_df_maybank(txns, uploaded_file.name, saldo_awal)
                 
             elif detected_bank == "BCA":
-                txns = parse_bca_smart(uploaded_file, password=password)
+                txns = parse_bca_coordinates(uploaded_file, password=password)
                 df = build_df_bca(txns, uploaded_file.name)
             
             if not df.empty:
