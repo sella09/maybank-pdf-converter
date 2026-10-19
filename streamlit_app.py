@@ -8,19 +8,17 @@ st.set_page_config(page_title="Bank PDF to Excel", layout="wide")
 st.title("🏦 Bank PDF → Excel Converter")
 
 # ==========================================
-# FUNGSI BANTUAN KONVERSI ANGKA
+# FUNGSI BANTUAN
 # ==========================================
 def to_float_indo_mb(s):
-    # Maybank: 1.234.567,89
     if not s: return None
     try: return float(s.replace(".", "").replace(",", "."))
     except: return None
 
 def to_float_indo_bca(s):
-    # BCA: 1,234,567.89
     if not s: return None
     try: 
-        clean = s.replace(",", "")
+        clean = s.replace(",", "").replace(" ", "")
         return float(clean)
     except: return None
 
@@ -78,7 +76,7 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA (Regex Ketat + Membaca dari Kanan)
+# PARSER BCA (Sapu Bersih)
 # ==========================================
 def parse_bca_manual(file_obj, password=None):
     transactions = []
@@ -117,33 +115,35 @@ def parse_bca_manual(file_obj, password=None):
                 tgl_bulan = match.group(1)
                 content = match.group(2).strip()
                 
-                if "SALDO AWAL" in content.upper(): continue
+                # Abaikan jika ini baris Saldo Awal atau ringkasan
+                if "SALDO AWAL" in content.upper() or "MUTASI CR" in content.upper():
+                    continue
                 
                 tgl = f"{tgl_bulan}/{tahun}"
                 
                 # CARI SEMUA ANGKA (Format BCA: xxx,xxx.xx)
-                # Kita pakai findall untuk memisahkan angka dari teks
+                # Termasuk angka minus (misal -971,172,411.87)
                 amounts = re.findall(r"-?\d{1,3}(?:,\d{3})*\.\d{2}", content)
                 
                 debit, kredit, saldo = None, None, None
                 
+                # LOGIKA BARU: Baca dari KANAN
+                # Angka terakhir adalah Saldo, angka sebelumnya adalah Nominal Mutasi.
                 if len(amounts) >= 2:
-                    # Ambil dari KANAN: Saldo adalah yang terakhir, Nominal adalah sebelumnya
                     saldo_str = amounts[-1]
                     nominal_str = amounts[-2]
                     
                     saldo = to_float_indo_bca(saldo_str)
                     nominal = to_float_indo_bca(nominal_str)
                     
-                    # Cek Debit / Kredit berdasarkan keberadaan 'DB' di sekitar nominal
-                    # Kita potong teksnya untuk mencari 'DB' di dekat nominal tersebut
+                    # Cek Debit / Kredit
                     if "DB" in content.upper():
                         debit = nominal
                     else:
                         kredit = nominal
                         
                 elif len(amounts) == 1:
-                    # Hanya ada 1 angka, anggap nominal (saldo kosong di PDF)
+                    # Kadang PDF BCA memotong saldo ke halaman berikutnya.
                     nominal = to_float_indo_bca(amounts[0])
                     if "DB" in content.upper(): debit = nominal
                     else: kredit = nominal
@@ -155,7 +155,7 @@ def parse_bca_manual(file_obj, password=None):
                     desc = desc.replace(amt, "")
                 # Buang kata 'DB'
                 desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
-                # Rapikan spasi berlebih
+                # Rapikan spasi
                 desc = " ".join(desc.split())
 
                 transactions.append({
