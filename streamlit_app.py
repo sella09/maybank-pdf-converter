@@ -6,7 +6,6 @@ from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel", layout="wide")
 st.title("🏦 Bank PDF → Excel Converter")
-st.write("Upload PDF Rekening Koran (Maybank / BCA), lalu unduh hasilnya.")
 
 # ==========================================
 # FUNGSI BANTUAN
@@ -18,7 +17,10 @@ def to_float_indo_mb(s):
 
 def to_float_indo_bca(s):
     if not s: return None
-    try: return float(s.replace(",", "").replace(" ", ""))
+    try: 
+        # Bersihkan dari karakter aneh
+        clean = s.replace(",", "").replace(" ", "")
+        return float(clean)
     except: return None
 
 # ==========================================
@@ -75,71 +77,89 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA (Text Strategy)
+# PARSER BCA (Manual Split by Line)
 # ==========================================
-def parse_bca_tables(file_obj, password=None):
+def parse_bca_manual(file_obj, password=None):
     transactions = []
     pdf_args = {"password": password} if password else {}
     
     with pdfplumber.open(file_obj, **pdf_args) as pdf:
         tahun = "2026"
-        # Cari tahun di halaman 1
         page1_text = pdf.pages[0].extract_text() or ""
         match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", page1_text, re.IGNORECASE)
         if match_thn: tahun = match_thn.group(1)
 
         for page in pdf.pages:
-            # Gunakan text-based strategy karena garis tabel BCA kadang tidak terdeteksi
-            table = page.extract_table({
-                "vertical_strategy": "text",
-                "horizontal_strategy": "text",
-                "text_tolerance": 2,
-                "intersection_tolerance": 15
-            })
+            text = page.extract_text() or ""
+            lines = text.split("\n")
             
-            if not table: continue
+            # Gabungkan baris yang terpotong (jika baris berikutnya bukan diawali tanggal)
+            merged_lines = []
+            current_line = ""
             
-            for row in table:
-                if len(row) < 4: continue
-                row = [(str(c).strip() if c else "") for c in row]
+            for line in lines:
+                line = line.strip()
+                if not line: continue
                 
-                # Cari sel yang berisi format DD/MM (awal transaksi)
-                date_idx = -1
-                for i, cell in enumerate(row):
-                    if re.match(r"^\d{2}/\d{2}$", cell):
-                        date_idx = i
-                        break
+                # Jika baris diawali tanggal DD/MM
+                if re.match(r"^\d{2}/\d{2}", line):
+                    if current_line: merged_lines.append(current_line)
+                    current_line = line
+                else:
+                    # Jika bukan tanggal, lanjutkan baris sebelumnya (deskripsi multi-baris)
+                    if current_line:
+                        current_line += " " + line
+                    else:
+                        merged_lines.append(line) # Header/footer
+            
+            if current_line: merged_lines.append(current_line)
+
+            for line in merged_lines:
+                # Cari baris transaksi
+                match = re.match(r"^(\d{2}/\d{2})(.*)", line)
+                if not match: continue
                 
-                if date_idx == -1: continue 
+                tgl_bulan = match.group(1)
+                content = match.group(2).strip()
                 
-                tgl = f"{row[date_idx]}/{tahun}"
+                # Abaikan baris "SALDO AWAL"
+                if "SALDO AWAL" in content.upper(): 
+                    continue
                 
-                # Gabungkan seluruh teks di baris ini untuk mencari keterangan, nominal, & saldo
-                mutasi_str = " ".join(row)
+                tgl = f"{tgl_bulan}/{tahun}"
                 
-                # Cari semua angka berformat BCA (1,234,567.89)
-                numbers = re.findall(r"-?\d{1,3}(?:,\d{3})*\.\d{2}", mutasi_str)
+                # Cari semua angka format BCA di baris ini (termasuk yang negatif)
+                amounts = re.findall(r"-?\d{1,3}(?:,\d{3})*\.\d{2}", content)
                 
                 debit, kredit, saldo = None, None, None
                 
-                if len(numbers) >= 2:
-                    # Angka terakhir = Saldo, angka sebelumnya = Nominal
-                    nominal = to_float_indo_bca(numbers[-2])
-                    saldo = to_float_indo_bca(numbers[-1])
-                    if "DB" in mutasi_str.upper(): debit = nominal
-                    else: kredit = nominal
-                elif len(numbers) == 1:
-                    nominal = to_float_indo_bca(numbers[0])
-                    if "DB" in mutasi_str.upper(): debit = nominal
-                    else: kredit = nominal
+                if len(amounts) >= 2:
+                    # Angka kedua dari belakang adalah Mutasi, angka terakhir adalah Saldo
+                    nominal = to_float_indo_bca(amounts[-2])
+                    saldo = to_float_indo_bca(amounts[-1])
+                    
+                    # Cek apakah Debit (ada tulisan 'DB') atau Kredit
+                    if re.search(r"\bDB\b", content, re.IGNORECASE):
+                        debit = nominal
+                    else:
+                        kredit = nominal
+                        
+                elif len(amounts) == 1:
+                    # Hanya ada 1 angka (biasanya karena saldo kosong di PDF)
+                    nominal = to_float_indo_bca(amounts[0])
+                    if re.search(r"\bDB\b", content, re.IGNORECASE):
+                        debit = nominal
+                    else:
+                        kredit = nominal
                 
-                # Bersihkan keterangan: buang tanggal, nominal, saldo, dan kata 'DB'
-                desc = mutasi_str
-                if row[date_idx]: desc = desc.replace(row[date_idx], "")
-                for n in numbers: desc = desc.replace(n, "")
+                # Bersihkan Keterangan:
+                desc = content
+                # Buang angka dari teks keterangan
+                for amt in amounts:
+                    desc = desc.replace(amt, "")
+                # Buang kata 'DB'
                 desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
-                
-                # Rapikan spasi berlebih
+                # Rapikan spasi
                 desc = " ".join(desc.split())
 
                 transactions.append({
@@ -150,6 +170,7 @@ def parse_bca_tables(file_obj, password=None):
                     "Kredit": kredit,
                     "Saldo": saldo
                 })
+                
     return transactions
 
 def build_df_bca(transactions, sumber_file):
@@ -190,7 +211,7 @@ if uploaded_files:
                 elif "Maybank" in first_page_text:
                     detected_bank = "Maybank"
                 else:
-                    detected_bank = "Maybank" # Default
+                    detected_bank = "Maybank" 
 
             st.info(f"Memproses **{uploaded_file.name}** sebagai **{detected_bank}**...")
 
@@ -208,7 +229,7 @@ if uploaded_files:
                 df = build_df_maybank(txns, uploaded_file.name, saldo_awal)
                 
             elif detected_bank == "BCA":
-                txns = parse_bca_tables(uploaded_file, password=password)
+                txns = parse_bca_manual(uploaded_file, password=password)
                 df = build_df_bca(txns, uploaded_file.name)
             
             if not df.empty:
