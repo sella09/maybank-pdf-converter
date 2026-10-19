@@ -18,7 +18,6 @@ def to_float_indo_mb(s):
 def to_float_indo_bca(s):
     if not s: return None
     try: 
-        # Bersihkan dari karakter selain angka, titik, dan minus
         clean = re.sub(r"[^\d.-]", "", s)
         return float(clean)
     except: return None
@@ -77,9 +76,9 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA (Versi 6.0 - By Table Lines)
+# PARSER BCA (Versi 7.0 - Smart Line)
 # ==========================================
-def parse_bca_tables(file_obj, password=None):
+def parse_bca_smart(file_obj, password=None):
     transactions = []
     pdf_args = {"password": password} if password else {}
     
@@ -89,79 +88,95 @@ def parse_bca_tables(file_obj, password=None):
         match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", page1_text, re.IGNORECASE)
         if match_thn: tahun = match_thn.group(1)
 
+        # Kumpulkan semua baris dari semua halaman
+        all_lines = []
         for page in pdf.pages:
-            # Kembali ke mode "lines" karena PDF BCA punya garis tabel
-            tables = page.extract_tables({
-                "vertical_strategy": "lines",
-                "horizontal_strategy": "lines"
+            text = page.extract_text() or ""
+            all_lines.extend(text.split("\n"))
+            
+        merged_lines = []
+        current_line = ""
+        
+        for line in all_lines:
+            line = line.strip()
+            if not line: continue
+            
+            # Jika baris diawali DD/MM, itu transaksi baru
+            if re.match(r"^\d{2}/\d{2}", line):
+                if current_line: merged_lines.append(current_line)
+                current_line = line
+            else:
+                # Jika bukan tanggal, gabungkan ke transaksi sebelumnya
+                if current_line:
+                    current_line += " " + line
+                else:
+                    merged_lines.append(line) # Header
+                    
+        if current_line: merged_lines.append(current_line)
+
+        for line in merged_lines:
+            match = re.match(r"^(\d{2}/\d{2})(.*)", line)
+            if not match: continue
+            
+            tgl_bulan = match.group(1)
+            content = match.group(2).strip()
+            
+            if "SALDO AWAL" in content.upper() or "MUTASI" in content.upper(): 
+                continue
+            
+            tgl = f"{tgl_bulan}/{tahun}"
+            
+            debit, kredit, saldo = None, None, None
+            desc = content
+            
+            # CARI ANGKA DARI BELAKANG (Saldo adalah angka terakhir)
+            # Pola angka: desimal pakai titik (contoh: 1,099,000.00)
+            amounts = re.findall(r"-?\d{1,3}(?:,\d{3})*\.\d{2}", content)
+            
+            if amounts:
+                # Ambil angka terakhir sebagai Saldo
+                saldo_str = amounts[-1]
+                saldo = to_float_indo_bca(saldo_str)
+                
+                # Hapus angka saldo dari teks deskripsi
+                desc = desc.replace(saldo_str, "")
+                
+                # Cek apakah ada nominal mutasi sebelum saldo
+                if len(amounts) >= 2:
+                    nominal_str = amounts[-2]
+                    nominal = to_float_indo_bca(nominal_str)
+                    
+                    # Cek Debit / Kredit
+                    # Biasanya ada teks 'DB' tepat setelah nominal
+                    if "DB" in content.upper():
+                        debit = nominal
+                    else:
+                        kredit = nominal
+                        
+                    desc = desc.replace(nominal_str, "")
+                else:
+                    # Jika hanya ada 1 angka, dan ada 'DB', berarti itu nominal
+                    if "DB" in content.upper():
+                        nominal = to_float_indo_bca(amounts[0])
+                        debit = nominal
+                        desc = desc.replace(amounts[0], "")
+                    else:
+                        # Jika bukan DB, berarti saldo saja (mutasi kosong, jarang terjadi)
+                        pass
+
+            # Bersihkan Keterangan
+            desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
+            desc = " ".join(desc.split()).strip(" ,-")
+            
+            transactions.append({
+                "Tanggal": tgl,
+                "Kode": "-",
+                "Keterangan": desc,
+                "Debit": debit,
+                "Kredit": kredit,
+                "Saldo": saldo
             })
             
-            if not tables: continue
-            
-            for table in tables:
-                for row in table:
-                    # Row biasanya: [Tanggal, Keterangan, CBG, Mutasi, Saldo]
-                    # Bersihkan sel
-                    row = [(str(c).replace("\n", " ").strip() if c else "") for c in row]
-                    
-                    if len(row) < 4: continue
-                    
-                    # Cari sel yang berisi format tanggal DD/MM
-                    date_idx = -1
-                    for i, cell in enumerate(row):
-                        if re.match(r"^\d{2}/\d{2}$", cell):
-                            date_idx = i
-                            break
-                    
-                    if date_idx == -1: continue
-                    
-                    tgl_bulan = row[date_idx]
-                    keterangan = row[date_idx+1] if len(row) > date_idx+1 else ""
-                    
-                    # Cari kolom mutasi (biasanya ada angka atau teks DB)
-                    mutasi_str = ""
-                    for cell in row:
-                        if re.search(r"\d{1,3}(?:,\d{3})*\.\d{2}", cell) and "DB" in cell.upper():
-                            mutasi_str = cell
-                            break
-                    
-                    # Jika tidak ada DB di kolom mutasi, cari sel yang ada angkanya
-                    if not mutasi_str:
-                        for cell in row:
-                            if re.search(r"\d{1,3}(?:,\d{3})*\.\d{2}", cell):
-                                mutasi_str = cell
-                                break
-
-                    # Cari kolom saldo (biasanya di paling kanan dan ada tanda minus jika minus)
-                    saldo_str = ""
-                    for cell in reversed(row):
-                        if re.search(r"-?\d{1,3}(?:,\d{3})*\.\d{2}", cell):
-                            saldo_str = cell
-                            break
-                    
-                    # Parsing Angka
-                    debit, kredit, saldo = None, None, None
-                    
-                    if mutasi_str:
-                        match_amt = re.search(r"(\d{1,3}(?:,\d{3})*\.\d{2})", mutasi_str)
-                        if match_amt:
-                            nominal = to_float_indo_bca(match_amt.group(1))
-                            if "DB" in mutasi_str.upper(): debit = nominal
-                            else: kredit = nominal
-                            
-                    if saldo_str:
-                        match_saldo = re.search(r"(-?\d{1,3}(?:,\d{3})*\.\d{2})", saldo_str)
-                        if match_saldo:
-                            saldo = to_float_indo_bca(match_saldo.group(1))
-                    
-                    transactions.append({
-                        "Tanggal": f"{tgl_bulan}/{tahun}",
-                        "Kode": "-",
-                        "Keterangan": keterangan,
-                        "Debit": debit,
-                        "Kredit": kredit,
-                        "Saldo": saldo
-                    })
     return transactions
 
 def build_df_bca(transactions, sumber_file):
@@ -220,7 +235,7 @@ if uploaded_files:
                 df = build_df_maybank(txns, uploaded_file.name, saldo_awal)
                 
             elif detected_bank == "BCA":
-                txns = parse_bca_tables(uploaded_file, password=password)
+                txns = parse_bca_smart(uploaded_file, password=password)
                 df = build_df_bca(txns, uploaded_file.name)
             
             if not df.empty:
@@ -247,7 +262,6 @@ if uploaded_files:
         st.download_button(
             label="📥 Download sebagai Excel",
             data=processed_data,
-            format="xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            file_name="mutasi_gabungan.xlsx"
+            file_name="mutasi_gabungan.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
