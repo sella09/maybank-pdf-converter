@@ -84,7 +84,7 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
 def parse_bca_text(text, tahun="2026"):
     transactions = []
     
-    # Ambil tahun dari periode
+    # Ambil tahun dari periode (bisa format 31-08-26 atau Agustus 2026)
     match_thn = re.search(r"PERIODE\s*:\s*\d{2}-\d{2}-(\d{2})", text, re.IGNORECASE)
     if match_thn: 
         tahun = "20" + match_thn.group(1)
@@ -92,7 +92,6 @@ def parse_bca_text(text, tahun="2026"):
         match_thn2 = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", text, re.IGNORECASE)
         if match_thn2: tahun = match_thn2.group(1)
 
-    # Kumpulkan baris
     lines = text.split("\n")
     merged_lines = []
     current_line = ""
@@ -121,7 +120,6 @@ def parse_bca_text(text, tahun="2026"):
         
         tgl = f"{tgl_bulan}/{tahun}"
         
-        # Cari angka desimal BCA
         amounts = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*\.\d{2}", content)
         
         debit, kredit, saldo = None, None, None
@@ -134,7 +132,7 @@ def parse_bca_text(text, tahun="2026"):
             nominal = to_float_indo_bca(nominal_str)
             
             if "DB" in content.upper():
-                kredit = nominal # Sesuai permintaanmu sebelumnya (dibalik)
+                kredit = nominal 
             else:
                 debit = nominal
                 
@@ -177,10 +175,13 @@ def build_df_bca(transactions, sumber_file):
 # ==========================================
 # UI STREAMLIT
 # ==========================================
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
+
 with col1:
     bank_choice = st.selectbox("Pilih Bank", ["Deteksi Otomatis", "BCA", "Maybank"])
 with col2:
+    password = st.text_input("🔑 Password PDF (jika ada)", type="password")
+with col3:
     uploaded_files = st.file_uploader("📄 Pilih file (PDF / JPG / PNG)", type=["pdf", "jpg", "jpeg", "png"], accept_multiple_files=True)
 
 if uploaded_files:
@@ -191,19 +192,18 @@ if uploaded_files:
             
             # JIKA PDF
             if uploaded_file.name.lower().endswith(".pdf"):
-                with pdfplumber.open(uploaded_file) as pdf:
+                pdf_args = {"password": password} if password else {}
+                with pdfplumber.open(uploaded_file, **pdf_args) as pdf:
                     for page in pdf.pages:
-                        # Coba ekstrak teks digital
                         page_text = page.extract_text()
                         
-                        # Jika teks kosong, berarti PDF hasil scan -> pakai OCR
+                        # Jika teks kosong/kurang dari 50 karakter, berarti PDF hasil scan -> pakai OCR
                         if not page_text or len(page_text.strip()) < 50:
                             st.info(f"📸 Halaman PDF ini gambar/scan. Menjalankan OCR...")
-                            # Konversi halaman PDF ke gambar
                             images = convert_from_bytes(uploaded_file.read())
                             for img in images:
                                 page_text += pytesseract.image_to_string(img, lang='ind') + "\n"
-                            break # Jika satu halaman scan, proses semua sebagai gambar
+                            break 
                         
                         text += page_text + "\n"
             
@@ -228,9 +228,11 @@ if uploaded_files:
                 txns = parse_bca_text(text)
                 df = build_df_bca(txns, uploaded_file.name)
             else:
-                # (Logika Maybank tetap sama)
+                saldo_awal = None
+                match = SALDO_AWAL_RE_MB.search(text)
+                if match: saldo_awal = to_float_indo_mb(match.group(1))
                 txns = parse_maybank_text(text)
-                df = build_df_maybank(txns, uploaded_file.name)
+                df = build_df_maybank(txns, uploaded_file.name, saldo_awal)
             
             if not df.empty:
                 all_dfs.append(df)
