@@ -33,6 +33,7 @@ def parse_maybank_text(text):
     transactions = []
     date_pattern = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{4})\s+(.*)")
     current_txn = None
+    urutan = 0
     
     for line in lines:
         line = line.strip()
@@ -44,7 +45,9 @@ def parse_maybank_text(text):
             tgl, kode, sisa = date_match.groups()
             amounts = AMOUNT_RE_MB.findall(sisa)
             desc = AMOUNT_RE_MB.sub(" ", sisa).strip()
-            current_txn = {"Tanggal": tgl, "Kode": kode, "Keterangan": desc, "Nominal": amounts}
+            
+            urutan += 1
+            current_txn = {"Urutan": urutan, "Tanggal": tgl, "Kode": kode, "Keterangan": desc, "Nominal": amounts}
         else:
             if current_txn:
                 has_valid = bool(AMOUNT_RE_MB.search(line))
@@ -71,16 +74,20 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
             if saldo_f > prev_saldo: debit = nominal_f
             else: kredit = nominal_f
             
-        rows.append({"Sumber File": sumber_file, "Tanggal": txn["Tanggal"], "Kode": txn["Kode"], "Keterangan": txn["Keterangan"], "Debit": debit, "Kredit": kredit, "Saldo": saldo_f})
+        rows.append({
+            "Urutan": txn["Urutan"], "Sumber File": sumber_file, "Tanggal": txn["Tanggal"], 
+            "Kode": txn["Kode"], "Keterangan": txn["Keterangan"], "Debit": debit, "Kredit": kredit, "Saldo": saldo_f
+        })
         if saldo_f is not None: prev_saldo = saldo_f
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA
+# PARSER BCA (Dengan Kolom Urutan)
 # ==========================================
 def parse_bca_coordinates(file_obj, password=None):
     transactions = []
     pdf_args = {"password": password} if password else {}
+    urutan = 0
     
     with pdfplumber.open(file_obj, **pdf_args) as pdf:
         tahun = "2026"
@@ -138,8 +145,10 @@ def parse_bca_coordinates(file_obj, password=None):
                         continue
                         
                     desc = " ".join(desc.split())
+                    urutan += 1
                     
                     current_txn = {
+                        "Urutan": urutan,
                         "Tanggal": f"{tgl_bulan}/{tahun}",
                         "Kode": "-",
                         "Keterangan": desc,
@@ -179,6 +188,7 @@ def build_df_bca(transactions, sumber_file):
     rows = []
     for txn in transactions:
         rows.append({
+            "Urutan": txn["Urutan"],
             "Sumber File": sumber_file,
             "Tanggal": txn["Tanggal"],
             "Kode": txn["Kode"],
@@ -251,17 +261,19 @@ if uploaded_files:
         final_df = pd.concat(all_dfs, ignore_index=True)
         
         # ==========================================
-        # FITUR BARU: URUTKAN BERDASARKAN TANGGAL
+        # FITUR BARU: URUTKAN BERDASARKAN TANGGAL & URUTAN ASLI
         # ==========================================
         try:
-            # 1. Ubah kolom Tanggal menjadi format datetime agar bisa di-sort
+            # 1. Ubah format tanggal jadi datetime
             final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
             
-            # 2. Urutkan berdasarkan tanggal, lalu hapus kolom bantuan
-            final_df = final_df.sort_values(by='Tanggal_DT', na_position='last')
-            final_df = final_df.drop(columns=['Tanggal_DT'])
+            # 2. Urutkan berdasarkan Tanggal, lalu Urutan Asli
+            final_df = final_df.sort_values(by=['Tanggal_DT', 'Urutan'])
             
-            st.info("💡 Data telah diurutkan secara otomatis dari tanggal paling awal ke paling akhir.")
+            # 3. Hapus kolom bantuan (Tanggal_DT dan Urutan)
+            final_df = final_df.drop(columns=['Tanggal_DT', 'Urutan'])
+            
+            st.info("💡 Data telah diurutkan secara otomatis (Tanggal, lalu urutan asli dari PDF).")
         except Exception as e:
             st.warning(f"Gagal mengurutkan tanggal: {e}")
 
