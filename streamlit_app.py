@@ -79,18 +79,16 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA (Dari Teks OCR / Digital)
+# PARSER BCA (Lebih Toleran untuk OCR)
 # ==========================================
 def parse_bca_text(text, tahun="2026"):
     transactions = []
     
-    # Ambil tahun dari periode (bisa format 31-08-26 atau Agustus 2026)
-    match_thn = re.search(r"PERIODE\s*:\s*\d{2}-\d{2}-(\d{2})", text, re.IGNORECASE)
+    # Cari tahun dengan format apapun
+    match_thn = re.search(r"PERIODE\s*:.*?(\d{2})", text, re.IGNORECASE)
     if match_thn: 
-        tahun = "20" + match_thn.group(1)
-    else:
-        match_thn2 = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", text, re.IGNORECASE)
-        if match_thn2: tahun = match_thn2.group(1)
+        thn_str = match_thn.group(1)
+        if len(thn_str) == 2: tahun = "20" + thn_str
 
     lines = text.split("\n")
     merged_lines = []
@@ -100,8 +98,9 @@ def parse_bca_text(text, tahun="2026"):
         line = line.strip()
         if not line: continue
         
-        # Deteksi awal baris transaksi (DD/MM)
-        if re.match(r"^\d{2}/\d{2}", line):
+        # LOOSEN REGEX: Cari tanggal DD/MM di mana saja di baris (bukan hanya di awal)
+        # Kadang OCR menambahkan karakter aneh sebelum tanggal
+        if re.search(r"\d{2}/\d{2}", line):
             if current_line: merged_lines.append(current_line)
             current_line = line
         else:
@@ -110,17 +109,19 @@ def parse_bca_text(text, tahun="2026"):
     if current_line: merged_lines.append(current_line)
 
     for line in merged_lines:
-        match = re.match(r"^(\d{2}/\d{2})(.*)", line)
+        # Ekstrak tanggal
+        match = re.search(r"(\d{2}/\d{2})", line)
         if not match: continue
         
         tgl_bulan = match.group(1)
-        content = match.group(2).strip()
+        content = line.replace(tgl_bulan, "", 1).strip()
         
         if "SALDO AWAL" in content.upper(): continue
         
         tgl = f"{tgl_bulan}/{tahun}"
         
-        amounts = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*\.\d{2}", content)
+        # Cari angka desimal BCA (lebih toleran: menerima titik atau koma)
+        amounts = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*[,.]\d{2}", content)
         
         debit, kredit, saldo = None, None, None
         
@@ -141,7 +142,6 @@ def parse_bca_text(text, tahun="2026"):
             if "DB" in content.upper(): kredit = nominal
             else: debit = nominal
         
-        # Bersihkan Keterangan
         desc = content
         for amt in amounts: desc = desc.replace(amt, "")
         desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
@@ -196,10 +196,8 @@ if uploaded_files:
                 with pdfplumber.open(uploaded_file, **pdf_args) as pdf:
                     for page in pdf.pages:
                         page_text = page.extract_text()
-                        
-                        # Jika teks kosong/kurang dari 50 karakter, berarti PDF hasil scan -> pakai OCR
                         if not page_text or len(page_text.strip()) < 50:
-                            st.info(f"📸 Halaman PDF ini gambar/scan. Menjalankan OCR...")
+                            st.info(f"📸 Memproses OCR untuk {uploaded_file.name}...")
                             images = convert_from_bytes(uploaded_file.read())
                             for img in images:
                                 page_text += pytesseract.image_to_string(img, lang='ind') + "\n"
@@ -207,11 +205,15 @@ if uploaded_files:
                         
                         text += page_text + "\n"
             
-            # JIKA GAMBAR (JPG/PNG)
+            # JIKA GAMBAR
             else:
-                st.info(f"📸 Memproses gambar {uploaded_file.name} dengan OCR...")
+                st.info(f"📸 Memproses OCR untuk {uploaded_file.name}...")
                 img = Image.open(uploaded_file)
                 text = pytesseract.image_to_string(img, lang='ind')
+
+            # TAMPILKAN TEKS OCR UNTUK DEBUGGING
+            with st.expander(f"🔍 Teks Asli Hasil Scan ({uploaded_file.name})"):
+                st.text(text)
 
             # Deteksi Bank
             detected_bank = bank_choice
@@ -221,9 +223,6 @@ if uploaded_files:
                 else:
                     detected_bank = "Maybank"
 
-            st.success(f"✅ File **{uploaded_file.name}** terbaca sebagai **{detected_bank}**.")
-
-            # Parsing
             if detected_bank == "BCA":
                 txns = parse_bca_text(text)
                 df = build_df_bca(txns, uploaded_file.name)
@@ -236,8 +235,9 @@ if uploaded_files:
             
             if not df.empty:
                 all_dfs.append(df)
+                st.success(f"✅ {uploaded_file.name}: {len(df)} transaksi terdeteksi.")
             else:
-                st.warning(f"⚠️ {uploaded_file.name}: tidak ada transaksi terdeteksi.")
+                st.warning(f"⚠️ {uploaded_file.name}: Gagal membaca transaksi. Silakan cek kotak 'Teks Asli Hasil Scan' di atas untuk melihat apa yang dibaca mesin.")
                 
         except Exception as e:
             st.error(f"❌ **{uploaded_file.name}**: {type(e).__name__}")
