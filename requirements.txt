@@ -5,3 +5,5 @@ openpyxl
 pytesseract
 pdf2image
 Pillow
+opencv-python-headless
+numpy
