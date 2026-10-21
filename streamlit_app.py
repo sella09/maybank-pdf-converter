@@ -31,84 +31,32 @@ def to_float_indo_bca(s):
 # FUNGSI PRE-PROCESSING GAMBAR UNTUK OCR
 # ==========================================
 def preprocess_image(image_pil):
-    # Konversi PIL ke format OpenCV (numpy array)
+    # Konversi PIL ke format OpenCV
     img = np.array(image_pil)
     
-    # 1. Ubah ke Grayscale
+    # 1. Grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     
-    # 2. Naikkan Resolusi (Zoom 2x) agar huruf kecil terbaca
-    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    # 2. Thresholding (Hitam Putih tegas)
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
     
-    # 3. Thresholding (Ubah jadi hitam putih tegas)
-    # Metode Otsu otomatis mencari batas warna terbaik
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # 3. Naikkan Resolusi (Zoom 2x) agar huruf kecil tajam
+    resized = cv2.resize(thresh, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     
-    # Kembalikan ke format PIL untuk Tesseract
-    return Image.fromarray(thresh)
+    return Image.fromarray(resized)
 
 # ==========================================
-# PARSER MAYBANK
+# PARSER BCA (Khusus OCR)
 # ==========================================
-AMOUNT_RE_MB = re.compile(r"(?<![\w/])(\d{1,3}(?:\.\d{3})*,\d{2})(?![\w/])")
-SALDO_AWAL_RE_MB = re.compile(r"Saldo\s+Awal\s*:?\s*([\d.]+,\d{2})", re.IGNORECASE)
-
-def parse_maybank_text(text):
-    lines = text.split("\n")
-    transactions = []
-    date_pattern = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{4})\s+(.*)")
-    current_txn = None
-    
-    for line in lines:
-        line = line.strip()
-        if not line: continue
-        date_match = date_pattern.match(line)
-        
-        if date_match:
-            if current_txn: transactions.append(current_txn)
-            tgl, kode, sisa = date_match.groups()
-            amounts = AMOUNT_RE_MB.findall(sisa)
-            desc = AMOUNT_RE_MB.sub(" ", sisa).strip()
-            current_txn = {"Tanggal": tgl, "Kode": kode, "Keterangan": desc, "Nominal": amounts}
-        else:
-            if current_txn:
-                has_valid = bool(AMOUNT_RE_MB.search(line))
-                amounts = AMOUNT_RE_MB.findall(line) if has_valid else []
-                desc = AMOUNT_RE_MB.sub(" ", line).strip() if has_valid else line
-                if desc: current_txn["Keterangan"] += " " + desc
-                if len(current_txn["Nominal"]) < 2 and amounts: current_txn["Nominal"].extend(amounts)
-    if current_txn: transactions.append(current_txn)
-    return transactions
-
-def build_df_maybank(transactions, sumber_file, saldo_awal=None):
-    rows = []
-    prev_saldo = saldo_awal
-    for txn in transactions:
-        amounts = txn["Nominal"]
-        nominal = amounts[0] if len(amounts) >= 2 else None
-        saldo = amounts[1] if len(amounts) >= 2 else (amounts[0] if len(amounts) == 1 else None)
-        
-        nominal_f = to_float_indo_mb(nominal)
-        saldo_f = to_float_indo_mb(saldo) if saldo else prev_saldo
-        
-        debit, kredit = None, None
-        if saldo_f is not None and prev_saldo is not None and nominal_f is not None:
-            if saldo_f > prev_saldo: debit = nominal_f
-            else: kredit = nominal_f
-            
-        rows.append({"Sumber File": sumber_file, "Tanggal": txn["Tanggal"], "Kode": txn["Kode"], "Keterangan": txn["Keterangan"], "Debit": debit, "Kredit": kredit, "Saldo": saldo_f})
-        if saldo_f is not None: prev_saldo = saldo_f
-    return pd.DataFrame(rows)
-
-# ==========================================
-# PARSER BCA
-# ==========================================
-def parse_bca_text(text, tahun="2026"):
+def parse_bca_ocr(text, tahun="2026"):
     transactions = []
     
-    match_thn = re.search(r"PERIODE\s*:.*?(\d{4})", text, re.IGNORECASE)
-    if match_thn: tahun = match_thn.group(1)
+    # Ambil tahun dari "PERIODE : 31-08-26"
+    match_thn = re.search(r"PERIODE\s*:.*?(\d{2})-\d{2}-\d{2}", text, re.IGNORECASE)
+    if match_thn: 
+        tahun = "20" + match_thn.group(1)
 
+    # Potong teks hanya dari "SALDO AWAL" ke bawah
     text_lower = text.upper()
     idx_saldo_awal = text_lower.find("SALDO AWAL")
     if idx_saldo_awal != -1:
@@ -122,6 +70,7 @@ def parse_bca_text(text, tahun="2026"):
         line = line.strip()
         if not line: continue
         
+        # Baris baru jika diawali DD/MM
         if re.match(r"^\d{2}/\d{2}", line):
             if current_line: merged_lines.append(current_line)
             current_line = line
@@ -141,11 +90,13 @@ def parse_bca_text(text, tahun="2026"):
         
         tgl = f"{tgl_bulan}/{tahun}"
         
+        # Cari angka desimal .xx
         amounts = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*[,.]\d{2}", content)
         
         debit, kredit, saldo = None, None, None
         
         if len(amounts) >= 2:
+            # Angka paling kanan adalah Saldo, angka sebelumnya Mutasi
             saldo_str = amounts[-1]
             nominal_str = amounts[-2]
             
@@ -162,13 +113,11 @@ def parse_bca_text(text, tahun="2026"):
             if "DB" in content.upper(): kredit = nominal
             else: debit = nominal
         
+        # Bersihkan Keterangan
         desc = content
         for amt in amounts: desc = desc.replace(amt, "")
         desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
         desc = " ".join(desc.split())
-
-        if not desc and debit is None and kredit is None and saldo is None:
-            continue
 
         transactions.append({
             "Tanggal": tgl,
@@ -198,14 +147,11 @@ def build_df_bca(transactions, sumber_file):
 # ==========================================
 # UI STREAMLIT
 # ==========================================
-col1, col2, col3 = st.columns(3)
-
+col1, col2 = st.columns(2)
 with col1:
-    bank_choice = st.selectbox("Pilih Bank", ["Deteksi Otomatis", "BCA", "Maybank"])
+    bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
 with col2:
-    password = st.text_input("🔑 Password PDF (jika ada)", type="password")
-with col3:
-    uploaded_files = st.file_uploader("📄 Pilih file (PDF / JPG / PNG)", type=["pdf", "jpg", "jpeg", "png"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader("📄 Pilih file gambar (JPG/PNG) atau PDF", type=["pdf", "jpg", "jpeg", "png"], accept_multiple_files=True)
 
 if uploaded_files:
     all_dfs = []
@@ -213,63 +159,46 @@ if uploaded_files:
         try:
             text = ""
             
+            # JIKA GAMBAR
+            if not uploaded_file.name.lower().endswith(".pdf"):
+                st.info(f"📸 Memproses OCR untuk {uploaded_file.name}...")
+                img = Image.open(uploaded_file).convert('RGB')
+                
+                # Proses Gambar (Tajamkan & Perbesar)
+                processed_img = preprocess_image(img)
+                
+                # OCR
+                text = pytesseract.image_to_string(processed_img, lang='ind')
+            
             # JIKA PDF
-            if uploaded_file.name.lower().endswith(".pdf"):
-                pdf_args = {"password": password} if password else {}
-                with pdfplumber.open(uploaded_file, **pdf_args) as pdf:
+            else:
+                with pdfplumber.open(uploaded_file) as pdf:
                     for page in pdf.pages:
                         page_text = page.extract_text()
                         if not page_text or len(page_text.strip()) < 50:
-                            st.info(f"📸 Memproses OCR untuk {uploaded_file.name}...")
                             images = convert_from_bytes(uploaded_file.read())
                             for img in images:
-                                # Pre-processing gambar sebelum OCR
                                 processed_img = preprocess_image(img)
                                 page_text += pytesseract.image_to_string(processed_img, lang='ind') + "\n"
-                            break 
-                        
+                            break
                         text += page_text + "\n"
-            
-            # JIKA GAMBAR
-            else:
-                st.info(f"📸 Memproses OCR untuk {uploaded_file.name}...")
-                img = Image.open(uploaded_file).convert('RGB')
-                # Pre-processing gambar sebelum OCR
-                processed_img = preprocess_image(img)
-                text = pytesseract.image_to_string(processed_img, lang='ind')
 
-            # TAMPILKAN TEKS OCR UNTUK DEBUGGING
+            # Tampilkan teks mentah hasil scan
             with st.expander(f"🔍 Teks Asli Hasil Scan ({uploaded_file.name})"):
                 st.text(text)
 
-            # Deteksi Bank
-            detected_bank = bank_choice
-            if bank_choice == "Deteksi Otomatis":
-                if "REKENING GIRO" in text.upper() or "BCA" in text.upper():
-                    detected_bank = "BCA"
-                else:
-                    detected_bank = "Maybank"
-
-            if detected_bank == "BCA":
-                txns = parse_bca_text(text)
+            if bank_choice == "BCA":
+                txns = parse_bca_ocr(text)
                 df = build_df_bca(txns, uploaded_file.name)
-            else:
-                saldo_awal = None
-                match = SALDO_AWAL_RE_MB.search(text)
-                if match: saldo_awal = to_float_indo_mb(match.group(1))
-                txns = parse_maybank_text(text)
-                df = build_df_maybank(txns, uploaded_file.name, saldo_awal)
             
             if not df.empty:
                 all_dfs.append(df)
-                st.success(f"✅ {uploaded_file.name}: {len(df)} transaksi terdeteksi.")
+                st.success(f"✅ {uploaded_file.name}: {len(df)} transaksi terbaca.")
             else:
-                st.warning(f"⚠️ {uploaded_file.name}: Gagal membaca transaksi. Silakan cek kotak 'Teks Asli Hasil Scan' di atas untuk melihat apa yang dibaca mesin.")
+                st.warning(f"⚠️ {uploaded_file.name}: Gagal membaca transaksi. Cek teks asli di atas.")
                 
         except Exception as e:
-            st.error(f"❌ **{uploaded_file.name}**: {type(e).__name__}")
-            with st.expander("Lihat detail error"):
-                st.exception(e)
+            st.error(f"❌ **{uploaded_file.name}**: {e}")
 
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
