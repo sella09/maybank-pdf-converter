@@ -79,17 +79,24 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA (Lebih Toleran untuk OCR)
+# PARSER BCA (Khusus OCR)
 # ==========================================
 def parse_bca_text(text, tahun="2026"):
     transactions = []
     
-    # Cari tahun dengan format apapun
-    match_thn = re.search(r"PERIODE\s*:.*?(\d{2})", text, re.IGNORECASE)
-    if match_thn: 
-        thn_str = match_thn.group(1)
-        if len(thn_str) == 2: tahun = "20" + thn_str
+    # Cari tahun
+    match_thn = re.search(r"PERIODE\s*:.*?(\d{4})", text, re.IGNORECASE)
+    if match_thn: tahun = match_thn.group(1)
+    else:
+        match_thn2 = re.search(r"PERIODE\s*:.*?(\d{2})-(\d{2})-(\d{2})", text, re.IGNORECASE)
+        if match_thn2: tahun = "20" + match_thn2.group(3)
 
+    # 1. BUANG HEADER: Hanya proses teks setelah "SALDO AWAL"
+    text_lower = text.upper()
+    idx_saldo_awal = text_lower.find("SALDO AWAL")
+    if idx_saldo_awal != -1:
+        text = text[idx_saldo_awal:]
+    
     lines = text.split("\n")
     merged_lines = []
     current_line = ""
@@ -98,9 +105,8 @@ def parse_bca_text(text, tahun="2026"):
         line = line.strip()
         if not line: continue
         
-        # LOOSEN REGEX: Cari tanggal DD/MM di mana saja di baris (bukan hanya di awal)
-        # Kadang OCR menambahkan karakter aneh sebelum tanggal
-        if re.search(r"\d{2}/\d{2}", line):
+        # Hanya anggap baris baru jika diawali DD/MM persis
+        if re.match(r"^\d{2}/\d{2}", line):
             if current_line: merged_lines.append(current_line)
             current_line = line
         else:
@@ -109,18 +115,18 @@ def parse_bca_text(text, tahun="2026"):
     if current_line: merged_lines.append(current_line)
 
     for line in merged_lines:
-        # Ekstrak tanggal
-        match = re.search(r"(\d{2}/\d{2})", line)
+        match = re.match(r"^(\d{2}/\d{2})(.*)", line)
         if not match: continue
         
         tgl_bulan = match.group(1)
-        content = line.replace(tgl_bulan, "", 1).strip()
+        content = match.group(2).strip()
         
+        # Buang jika ada teks "SALDO AWAL" di baris transaksi
         if "SALDO AWAL" in content.upper(): continue
         
         tgl = f"{tgl_bulan}/{tahun}"
         
-        # Cari angka desimal BCA (lebih toleran: menerima titik atau koma)
+        # Cari angka desimal BCA (lebih toleran untuk OCR)
         amounts = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*[,.]\d{2}", content)
         
         debit, kredit, saldo = None, None, None
@@ -142,10 +148,15 @@ def parse_bca_text(text, tahun="2026"):
             if "DB" in content.upper(): kredit = nominal
             else: debit = nominal
         
+        # Bersihkan Keterangan
         desc = content
         for amt in amounts: desc = desc.replace(amt, "")
         desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
         desc = " ".join(desc.split())
+
+        # Buang baris transaksi jika deskripsinya kosong dan tidak ada angka
+        if not desc and debit is None and kredit is None and saldo is None:
+            continue
 
         transactions.append({
             "Tanggal": tgl,
