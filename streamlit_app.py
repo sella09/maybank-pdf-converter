@@ -76,7 +76,7 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA (KOORDINAT & PERBAIKAN DEBIT/KREDIT)
+# PARSER BCA
 # ==========================================
 def parse_bca_coordinates(file_obj, password=None):
     transactions = []
@@ -91,19 +91,16 @@ def parse_bca_coordinates(file_obj, password=None):
         for page in pdf.pages:
             words = page.extract_words()
             
-            # Cari batas Y (bawah header tabel)
             start_y = 0
             for w in words:
                 if "TANGGAL" in w['text'].upper():
                     start_y = w['bottom'] + 5
                     break
             
-            # Bagi halaman menjadi 3 zona X
             page_width = page.width
             x_split_saldo = page_width * 0.75 
             x_split_mutasi = page_width * 0.65
             
-            # Kelompokkan kata berdasarkan baris (Y)
             lines = {}
             for w in words:
                 if w['top'] < start_y: continue
@@ -112,7 +109,6 @@ def parse_bca_coordinates(file_obj, password=None):
                     lines[y_key] = []
                 lines[y_key].append(w)
 
-            # Proses per baris dari atas ke bawah
             for y, word_list in sorted(lines.items()):
                 word_list.sort(key=lambda w: w['x0'])
                 
@@ -128,7 +124,6 @@ def parse_bca_coordinates(file_obj, password=None):
                     else:
                         text_kanan += w['text'] + " "
                 
-                # Apakah baris ini tanggal transaksi baru?
                 match = re.match(r"^(\d{2}/\d{2})(.*)", text_kiri.strip())
                 
                 if match:
@@ -155,27 +150,22 @@ def parse_bca_coordinates(file_obj, password=None):
                     
                     all_angka_mutasi = text_tengah + text_kiri
                     
-                    # Cari Saldo di kolom kanan
                     match_saldo = re.search(r"(-?\d{1,3}(?:[,.]\d{3})*\.\d{2})", text_kanan)
                     if match_saldo:
                         current_txn["Saldo"] = to_float_indo_bca(match_saldo.group(1))
                     
-                    # Cari Nominal Mutasi
                     match_mutasi = re.search(r"(\d{1,3}(?:[,.]\d{3})*\.\d{2})", all_angka_mutasi)
                     if match_mutasi:
                         nominal = to_float_indo_bca(match_mutasi.group(1))
                         
-                        # --- PERBAIKAN: Posisi Debit/Kredit DITUKAR ---
                         if "DB" in text_tengah.upper() or "DB" in text_kiri.upper():
                             current_txn["Kredit"] = nominal
                         else:
                             current_txn["Debit"] = nominal
-                        # ----------------------------------------------
                             
                         current_txn["Keterangan"] = current_txn["Keterangan"].replace(match_mutasi.group(1), "")
                             
                 elif 'current_txn' in locals() and current_txn is not None:
-                    # Baris lanjutan (teks deskripsi di bawahnya)
                     desc_lanjutan = " ".join(text_kiri.split())
                     if desc_lanjutan and not re.match(r"^-?\d{1,3}(?:[,.]\d{3})*\.\d{2}$", desc_lanjutan):
                         current_txn["Keterangan"] += " " + desc_lanjutan
@@ -259,6 +249,22 @@ if uploaded_files:
 
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
+        
+        # ==========================================
+        # FITUR BARU: URUTKAN BERDASARKAN TANGGAL
+        # ==========================================
+        try:
+            # 1. Ubah kolom Tanggal menjadi format datetime agar bisa di-sort
+            final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
+            
+            # 2. Urutkan berdasarkan tanggal, lalu hapus kolom bantuan
+            final_df = final_df.sort_values(by='Tanggal_DT', na_position='last')
+            final_df = final_df.drop(columns=['Tanggal_DT'])
+            
+            st.info("💡 Data telah diurutkan secara otomatis dari tanggal paling awal ke paling akhir.")
+        except Exception as e:
+            st.warning(f"Gagal mengurutkan tanggal: {e}")
+
         st.subheader("📊 Preview Data")
         st.dataframe(final_df, width='stretch')
         
