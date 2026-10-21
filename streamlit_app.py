@@ -46,6 +46,59 @@ def preprocess_image(image_pil):
     return Image.fromarray(resized)
 
 # ==========================================
+# PARSER MAYBANK
+# ==========================================
+AMOUNT_RE_MB = re.compile(r"(?<![\w/])(\d{1,3}(?:\.\d{3})*,\d{2})(?![\w/])")
+SALDO_AWAL_RE_MB = re.compile(r"Saldo\s+Awal\s*:?\s*([\d.]+,\d{2})", re.IGNORECASE)
+
+def parse_maybank_text(text):
+    lines = text.split("\n")
+    transactions = []
+    date_pattern = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{4})\s+(.*)")
+    current_txn = None
+    
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        date_match = date_pattern.match(line)
+        
+        if date_match:
+            if current_txn: transactions.append(current_txn)
+            tgl, kode, sisa = date_match.groups()
+            amounts = AMOUNT_RE_MB.findall(sisa)
+            desc = AMOUNT_RE_MB.sub(" ", sisa).strip()
+            current_txn = {"Tanggal": tgl, "Kode": kode, "Keterangan": desc, "Nominal": amounts}
+        else:
+            if current_txn:
+                has_valid = bool(AMOUNT_RE_MB.search(line))
+                amounts = AMOUNT_RE_MB.findall(line) if has_valid else []
+                desc = AMOUNT_RE_MB.sub(" ", line).strip() if has_valid else line
+                if desc: current_txn["Keterangan"] += " " + desc
+                if len(current_txn["Nominal"]) < 2 and amounts: current_txn["Nominal"].extend(amounts)
+    if current_txn: transactions.append(current_txn)
+    return transactions
+
+def build_df_maybank(transactions, sumber_file, saldo_awal=None):
+    rows = []
+    prev_saldo = saldo_awal
+    for txn in transactions:
+        amounts = txn["Nominal"]
+        nominal = amounts[0] if len(amounts) >= 2 else None
+        saldo = amounts[1] if len(amounts) >= 2 else (amounts[0] if len(amounts) == 1 else None)
+        
+        nominal_f = to_float_indo_mb(nominal)
+        saldo_f = to_float_indo_mb(saldo) if saldo else prev_saldo
+        
+        debit, kredit = None, None
+        if saldo_f is not None and prev_saldo is not None and nominal_f is not None:
+            if saldo_f > prev_saldo: debit = nominal_f
+            else: kredit = nominal_f
+            
+        rows.append({"Sumber File": sumber_file, "Tanggal": txn["Tanggal"], "Kode": txn["Kode"], "Keterangan": txn["Keterangan"], "Debit": debit, "Kredit": kredit, "Saldo": saldo_f})
+        if saldo_f is not None: prev_saldo = saldo_f
+    return pd.DataFrame(rows)
+
+# ==========================================
 # PARSER BCA (Khusus OCR)
 # ==========================================
 def parse_bca_ocr(text, tahun="2026"):
@@ -147,11 +200,15 @@ def build_df_bca(transactions, sumber_file):
 # ==========================================
 # UI STREAMLIT
 # ==========================================
-col1, col2 = st.columns(2)
+# Tampilan dibagi 3 kolom
+col1, col2, col3 = st.columns(3)
+
 with col1:
-    bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
+    bank_choice = st.selectbox("Pilih Bank", ["Deteksi Otomatis", "BCA", "Maybank"])
 with col2:
-    uploaded_files = st.file_uploader("📄 Pilih file gambar (JPG/PNG) atau PDF", type=["pdf", "jpg", "jpeg", "png"], accept_multiple_files=True)
+    password = st.text_input("🔑 Password PDF (jika ada)", type="password")
+with col3:
+    uploaded_files = st.file_uploader("📄 Pilih file (PDF / JPG / PNG)", type=["pdf", "jpg", "jpeg", "png"], accept_multiple_files=True)
 
 if uploaded_files:
     all_dfs = []
@@ -159,37 +216,52 @@ if uploaded_files:
         try:
             text = ""
             
-            # JIKA GAMBAR
+            # JIKA GAMBAR (JPG/PNG)
             if not uploaded_file.name.lower().endswith(".pdf"):
                 st.info(f"📸 Memproses OCR untuk {uploaded_file.name}...")
                 img = Image.open(uploaded_file).convert('RGB')
-                
-                # Proses Gambar (Tajamkan & Perbesar)
                 processed_img = preprocess_image(img)
-                
-                # OCR
                 text = pytesseract.image_to_string(processed_img, lang='ind')
             
             # JIKA PDF
             else:
-                with pdfplumber.open(uploaded_file) as pdf:
+                pdf_args = {"password": password} if password else {}
+                with pdfplumber.open(uploaded_file, **pdf_args) as pdf:
                     for page in pdf.pages:
                         page_text = page.extract_text()
+                        # Jika PDF hasil scan, gunakan OCR
                         if not page_text or len(page_text.strip()) < 50:
+                            st.info(f"📸 PDF hasil scan. Memproses OCR untuk {uploaded_file.name}...")
                             images = convert_from_bytes(uploaded_file.read())
                             for img in images:
                                 processed_img = preprocess_image(img)
                                 page_text += pytesseract.image_to_string(processed_img, lang='ind') + "\n"
-                            break
+                            break 
+                        
                         text += page_text + "\n"
 
             # Tampilkan teks mentah hasil scan
             with st.expander(f"🔍 Teks Asli Hasil Scan ({uploaded_file.name})"):
                 st.text(text)
 
-            if bank_choice == "BCA":
+            # Deteksi Bank
+            detected_bank = bank_choice
+            if bank_choice == "Deteksi Otomatis":
+                if "REKENING GIRO" in text.upper() or "BCA" in text.upper():
+                    detected_bank = "BCA"
+                else:
+                    detected_bank = "Maybank"
+
+            # Parsing
+            if detected_bank == "BCA":
                 txns = parse_bca_ocr(text)
                 df = build_df_bca(txns, uploaded_file.name)
+            else:
+                saldo_awal = None
+                match = SALDO_AWAL_RE_MB.search(text)
+                if match: saldo_awal = to_float_indo_mb(match.group(1))
+                txns = parse_maybank_text(text)
+                df = build_df_maybank(txns, uploaded_file.name, saldo_awal)
             
             if not df.empty:
                 all_dfs.append(df)
