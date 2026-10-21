@@ -3,12 +3,14 @@ import pdfplumber
 import pandas as pd
 import re
 import pytesseract
+import cv2
+import numpy as np
 from PIL import Image
 from pdf2image import convert_from_bytes
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (Support OCR)")
+st.title("🏦 Bank PDF → Excel Converter (OCR Enhanced)")
 
 # ==========================================
 # FUNGSI BANTUAN
@@ -24,6 +26,26 @@ def to_float_indo_bca(s):
         clean = re.sub(r"[^\d.-]", "", s)
         return float(clean)
     except: return None
+
+# ==========================================
+# FUNGSI PRE-PROCESSING GAMBAR UNTUK OCR
+# ==========================================
+def preprocess_image(image_pil):
+    # Konversi PIL ke format OpenCV (numpy array)
+    img = np.array(image_pil)
+    
+    # 1. Ubah ke Grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    
+    # 2. Naikkan Resolusi (Zoom 2x) agar huruf kecil terbaca
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    
+    # 3. Thresholding (Ubah jadi hitam putih tegas)
+    # Metode Otsu otomatis mencari batas warna terbaik
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Kembalikan ke format PIL untuk Tesseract
+    return Image.fromarray(thresh)
 
 # ==========================================
 # PARSER MAYBANK
@@ -79,19 +101,14 @@ def build_df_maybank(transactions, sumber_file, saldo_awal=None):
     return pd.DataFrame(rows)
 
 # ==========================================
-# PARSER BCA (Khusus OCR)
+# PARSER BCA
 # ==========================================
 def parse_bca_text(text, tahun="2026"):
     transactions = []
     
-    # Cari tahun
     match_thn = re.search(r"PERIODE\s*:.*?(\d{4})", text, re.IGNORECASE)
     if match_thn: tahun = match_thn.group(1)
-    else:
-        match_thn2 = re.search(r"PERIODE\s*:.*?(\d{2})-(\d{2})-(\d{2})", text, re.IGNORECASE)
-        if match_thn2: tahun = "20" + match_thn2.group(3)
 
-    # 1. BUANG HEADER: Hanya proses teks setelah "SALDO AWAL"
     text_lower = text.upper()
     idx_saldo_awal = text_lower.find("SALDO AWAL")
     if idx_saldo_awal != -1:
@@ -105,7 +122,6 @@ def parse_bca_text(text, tahun="2026"):
         line = line.strip()
         if not line: continue
         
-        # Hanya anggap baris baru jika diawali DD/MM persis
         if re.match(r"^\d{2}/\d{2}", line):
             if current_line: merged_lines.append(current_line)
             current_line = line
@@ -121,12 +137,10 @@ def parse_bca_text(text, tahun="2026"):
         tgl_bulan = match.group(1)
         content = match.group(2).strip()
         
-        # Buang jika ada teks "SALDO AWAL" di baris transaksi
         if "SALDO AWAL" in content.upper(): continue
         
         tgl = f"{tgl_bulan}/{tahun}"
         
-        # Cari angka desimal BCA (lebih toleran untuk OCR)
         amounts = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*[,.]\d{2}", content)
         
         debit, kredit, saldo = None, None, None
@@ -148,13 +162,11 @@ def parse_bca_text(text, tahun="2026"):
             if "DB" in content.upper(): kredit = nominal
             else: debit = nominal
         
-        # Bersihkan Keterangan
         desc = content
         for amt in amounts: desc = desc.replace(amt, "")
         desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
         desc = " ".join(desc.split())
 
-        # Buang baris transaksi jika deskripsinya kosong dan tidak ada angka
         if not desc and debit is None and kredit is None and saldo is None:
             continue
 
@@ -211,7 +223,9 @@ if uploaded_files:
                             st.info(f"📸 Memproses OCR untuk {uploaded_file.name}...")
                             images = convert_from_bytes(uploaded_file.read())
                             for img in images:
-                                page_text += pytesseract.image_to_string(img, lang='ind') + "\n"
+                                # Pre-processing gambar sebelum OCR
+                                processed_img = preprocess_image(img)
+                                page_text += pytesseract.image_to_string(processed_img, lang='ind') + "\n"
                             break 
                         
                         text += page_text + "\n"
@@ -219,8 +233,10 @@ if uploaded_files:
             # JIKA GAMBAR
             else:
                 st.info(f"📸 Memproses OCR untuk {uploaded_file.name}...")
-                img = Image.open(uploaded_file)
-                text = pytesseract.image_to_string(img, lang='ind')
+                img = Image.open(uploaded_file).convert('RGB')
+                # Pre-processing gambar sebelum OCR
+                processed_img = preprocess_image(img)
+                text = pytesseract.image_to_string(processed_img, lang='ind')
 
             # TAMPILKAN TEKS OCR UNTUK DEBUGGING
             with st.expander(f"🔍 Teks Asli Hasil Scan ({uploaded_file.name})"):
