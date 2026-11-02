@@ -10,11 +10,6 @@ st.title("🏦 Bank PDF → Excel Converter")
 # ==========================================
 # FUNGSI BANTUAN
 # ==========================================
-def to_float_indo_mb(s):
-    if not s: return None
-    try: return float(s.replace(".", "").replace(",", "."))
-    except: return None
-
 def to_float_indo_bca(s):
     if not s: return None
     try: 
@@ -23,164 +18,109 @@ def to_float_indo_bca(s):
     except: return None
 
 # ==========================================
-# PARSER MAYBANK
+# PARSER BCA (Versi 10.0 - Anti Gagal)
 # ==========================================
-AMOUNT_RE_MB = re.compile(r"(?<![\w/])(\d{1,3}(?:\.\d{3})*,\d{2})(?![\w/])")
-SALDO_AWAL_RE_MB = re.compile(r"Saldo\s+Awal\s*:?\s*([\d.]+,\d{2})", re.IGNORECASE)
-
-def parse_maybank_text(text):
-    lines = text.split("\n")
-    transactions = []
-    date_pattern = re.compile(r"^(\d{2}/\d{2}/\d{4})\s+(\d{4})\s+(.*)")
-    current_txn = None
-    urutan = 0
-    
-    for line in lines:
-        line = line.strip()
-        if not line: continue
-        date_match = date_pattern.match(line)
-        
-        if date_match:
-            if current_txn: transactions.append(current_txn)
-            tgl, kode, sisa = date_match.groups()
-            amounts = AMOUNT_RE_MB.findall(sisa)
-            desc = AMOUNT_RE_MB.sub(" ", sisa).strip()
-            
-            urutan += 1
-            current_txn = {"Urutan": urutan, "Tanggal": tgl, "Kode": kode, "Keterangan": desc, "Nominal": amounts}
-        else:
-            if current_txn:
-                has_valid = bool(AMOUNT_RE_MB.search(line))
-                amounts = AMOUNT_RE_MB.findall(line) if has_valid else []
-                desc = AMOUNT_RE_MB.sub(" ", line).strip() if has_valid else line
-                if desc: current_txn["Keterangan"] += " " + desc
-                if len(current_txn["Nominal"]) < 2 and amounts: current_txn["Nominal"].extend(amounts)
-    if current_txn: transactions.append(current_txn)
-    return transactions
-
-def build_df_maybank(transactions, sumber_file, saldo_awal=None):
-    rows = []
-    prev_saldo = saldo_awal
-    for txn in transactions:
-        amounts = txn["Nominal"]
-        nominal = amounts[0] if len(amounts) >= 2 else None
-        saldo = amounts[1] if len(amounts) >= 2 else (amounts[0] if len(amounts) == 1 else None)
-        
-        nominal_f = to_float_indo_mb(nominal)
-        saldo_f = to_float_indo_mb(saldo) if saldo else prev_saldo
-        
-        debit, kredit = None, None
-        if saldo_f is not None and prev_saldo is not None and nominal_f is not None:
-            if saldo_f > prev_saldo: debit = nominal_f
-            else: kredit = nominal_f
-            
-        rows.append({
-            "Urutan": txn["Urutan"], "Sumber File": sumber_file, "Tanggal": txn["Tanggal"], 
-            "Kode": txn["Kode"], "Keterangan": txn["Keterangan"], "Debit": debit, "Kredit": kredit, "Saldo": saldo_f
-        })
-        if saldo_f is not None: prev_saldo = saldo_f
-    return pd.DataFrame(rows)
-
-# ==========================================
-# PARSER BCA (Dengan Kolom Urutan)
-# ==========================================
-def parse_bca_coordinates(file_obj, password=None):
+def parse_bca_pdf(file_obj, password=None):
     transactions = []
     pdf_args = {"password": password} if password else {}
-    urutan = 0
     
     with pdfplumber.open(file_obj, **pdf_args) as pdf:
         tahun = "2026"
-        page1_text = pdf.pages[0].extract_text() or ""
-        match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", page1_text, re.IGNORECASE)
-        if match_thn: tahun = match_thn.group(1)
-
+        # 1. Ambil Teks Mentah
+        all_text = ""
         for page in pdf.pages:
-            words = page.extract_words()
-            
-            start_y = 0
-            for w in words:
-                if "TANGGAL" in w['text'].upper():
-                    start_y = w['bottom'] + 5
-                    break
-            
-            page_width = page.width
-            x_split_saldo = page_width * 0.75 
-            x_split_mutasi = page_width * 0.65
-            
-            lines = {}
-            for w in words:
-                if w['top'] < start_y: continue
-                y_key = round(w['top'] / 5) * 5 
-                if y_key not in lines:
-                    lines[y_key] = []
-                lines[y_key].append(w)
+            text = page.extract_text()
+            if text:
+                all_text += text + "\n"
 
-            for y, word_list in sorted(lines.items()):
-                word_list.sort(key=lambda w: w['x0'])
+        # 2. Cari Tahun dari "PERIODE : JANUARI 2026"
+        match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", all_text, re.IGNORECASE)
+        if match_thn: 
+            tahun = match_thn.group(1)
+
+        # 3. Potong teks hanya dari "SALDO AWAL" ke bawah
+        idx_awal = all_text.upper().find("SALDO AWAL")
+        if idx_awal != -1:
+            all_text = all_text[idx_awal:]
+
+        # 4. Gabungkan baris yang terpotong
+        lines = all_text.split("\n")
+        merged_lines = []
+        current_line = ""
+        
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            
+            # Baris baru jika diawali DD/MM
+            if re.match(r"^\d{2}/\d{2}", line):
+                if current_line: merged_lines.append(current_line)
+                current_line = line
+            else:
+                if current_line: current_line += " " + line
+
+        if current_line: merged_lines.append(current_line)
+
+        # 5. Ekstrak Data
+        urutan = 0
+        for line in merged_lines:
+            match = re.match(r"^(\d{2}/\d{2})(.*)", line)
+            if not match: continue
+            
+            tgl_bulan = match.group(1)
+            content = match.group(2).strip()
+            
+            # Abaikan baris Saldo Awal atau teks sampah
+            if "SALDO AWAL" in content.upper(): continue
+            
+            # Cari semua angka desimal .xx
+            amounts = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*[,.]\d{2}", content)
+            
+            saldo = None
+            debit = None
+            kredit = None
+            desc = content
+
+            if len(amounts) >= 1:
+                # Angka paling akhir PASTI Saldo
+                saldo_str = amounts[-1]
+                saldo = to_float_indo_bca(saldo_str)
+                desc = desc.replace(saldo_str, "")
                 
-                text_kiri = ""
-                text_tengah = ""
-                text_kanan = ""
-                
-                for w in word_list:
-                    if w['x0'] < x_split_mutasi:
-                        text_kiri += w['text'] + " "
-                    elif w['x0'] < x_split_saldo:
-                        text_tengah += w['text'] + " "
+                if len(amounts) >= 2:
+                    # Angka sebelumnya PASTI Mutasi
+                    nominal_str = amounts[-2]
+                    nominal = to_float_indo_bca(nominal_str)
+                    desc = desc.replace(nominal_str, "")
+                    
+                    # Tentukan Debit/Kredit (Sesuai permintaanmu yang terbalik)
+                    if "DB" in content.upper():
+                        kredit = nominal
                     else:
-                        text_kanan += w['text'] + " "
-                
-                match = re.match(r"^(\d{2}/\d{2})(.*)", text_kiri.strip())
-                
-                if match:
-                    if 'current_txn' in locals() and current_txn is not None:
-                        transactions.append(current_txn)
-                    
-                    tgl_bulan = match.group(1)
-                    desc = match.group(2).strip()
-                    
-                    if "SALDO AWAL" in desc.upper():
-                        current_txn = None
-                        continue
-                        
-                    desc = " ".join(desc.split())
-                    urutan += 1
-                    
-                    current_txn = {
-                        "Urutan": urutan,
-                        "Tanggal": f"{tgl_bulan}/{tahun}",
-                        "Kode": "-",
-                        "Keterangan": desc,
-                        "Debit": None,
-                        "Kredit": None,
-                        "Saldo": None
-                    }
-                    
-                    all_angka_mutasi = text_tengah + text_kiri
-                    
-                    match_saldo = re.search(r"(-?\d{1,3}(?:[,.]\d{3})*\.\d{2})", text_kanan)
-                    if match_saldo:
-                        current_txn["Saldo"] = to_float_indo_bca(match_saldo.group(1))
-                    
-                    match_mutasi = re.search(r"(\d{1,3}(?:[,.]\d{3})*\.\d{2})", all_angka_mutasi)
-                    if match_mutasi:
-                        nominal = to_float_indo_bca(match_mutasi.group(1))
-                        
-                        if "DB" in text_tengah.upper() or "DB" in text_kiri.upper():
-                            current_txn["Kredit"] = nominal
-                        else:
-                            current_txn["Debit"] = nominal
-                            
-                        current_txn["Keterangan"] = current_txn["Keterangan"].replace(match_mutasi.group(1), "")
-                            
-                elif 'current_txn' in locals() and current_txn is not None:
-                    desc_lanjutan = " ".join(text_kiri.split())
-                    if desc_lanjutan and not re.match(r"^-?\d{1,3}(?:[,.]\d{3})*\.\d{2}$", desc_lanjutan):
-                        current_txn["Keterangan"] += " " + desc_lanjutan
+                        debit = nominal
+            
+            # Bersihkan Deskripsi (Hapus kata 'DB' dan angka yang nyasar)
+            desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
+            desc = re.sub(r"\b\d{4}/\w+/\w+\b", "", desc) # Hapus kode referensi panjang
+            desc = " ".join(desc.split()).strip(" ,-")
+            
+            # Jika deskripsi kosong atau cuma kode, skip
+            if not desc and debit is None and kredit is None:
+                continue
 
-        if 'current_txn' in locals() and current_txn is not None:
-            transactions.append(current_txn)
+            # Konversi Tanggal ke format DD/MM/YYYY
+            tgl_full = f"{tgl_bulan}/{tahun}"
+            urutan += 1
+
+            transactions.append({
+                "Urutan": urutan,
+                "Tanggal": tgl_full,
+                "Kode": "-",
+                "Keterangan": desc,
+                "Debit": debit,
+                "Kredit": kredit,
+                "Saldo": saldo
+            })
             
     return transactions
 
@@ -205,7 +145,7 @@ def build_df_bca(transactions, sumber_file):
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    bank_choice = st.selectbox("Pilih Bank", ["Deteksi Otomatis", "BCA", "Maybank"])
+    bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
 with col2:
     password = st.text_input("🔑 Password PDF (jika ada)", type="password")
 with col3:
@@ -215,36 +155,9 @@ if uploaded_files:
     all_dfs = []
     for uploaded_file in uploaded_files:
         try:
-            detected_bank = bank_choice
-            if bank_choice == "Deteksi Otomatis":
-                with pdfplumber.open(uploaded_file, password=password if password else "") as pdf:
-                    first_page_text = pdf.pages[0].extract_text() or ""
-                
-                if "REKENING GIRO" in first_page_text and "BCA" in first_page_text:
-                    detected_bank = "BCA"
-                elif "Maybank" in first_page_text:
-                    detected_bank = "Maybank"
-                else:
-                    detected_bank = "Maybank" 
-
-            st.info(f"Memproses **{uploaded_file.name}** sebagai **{detected_bank}**...")
-
-            if detected_bank == "Maybank":
-                with pdfplumber.open(uploaded_file, password=password if password else "") as pdf:
-                    all_text = ""
-                    for page in pdf.pages:
-                        text = page.extract_text()
-                        if text: all_text += text + "\n"
-                
-                saldo_awal = None
-                match = SALDO_AWAL_RE_MB.search(all_text)
-                if match: saldo_awal = to_float_indo_mb(match.group(1))
-                txns = parse_maybank_text(all_text)
-                df = build_df_maybank(txns, uploaded_file.name, saldo_awal)
-                
-            elif detected_bank == "BCA":
-                txns = parse_bca_coordinates(uploaded_file, password=password)
-                df = build_df_bca(txns, uploaded_file.name)
+            st.info(f"Memproses **{uploaded_file.name}**...")
+            txns = parse_bca_pdf(uploaded_file, password=password)
+            df = build_df_bca(txns, uploaded_file.name)
             
             if not df.empty:
                 all_dfs.append(df)
@@ -260,20 +173,12 @@ if uploaded_files:
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
         
-        # ==========================================
-        # FITUR BARU: URUTKAN BERDASARKAN TANGGAL & URUTAN ASLI
-        # ==========================================
+        # FITUR URUTKAN
         try:
-            # 1. Ubah format tanggal jadi datetime
             final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
-            
-            # 2. Urutkan berdasarkan Tanggal, lalu Urutan Asli
+            # Urutkan berdasarkan tanggal, JIKA sama lihat urutan aslinya
             final_df = final_df.sort_values(by=['Tanggal_DT', 'Urutan'])
-            
-            # 3. Hapus kolom bantuan (Tanggal_DT dan Urutan)
             final_df = final_df.drop(columns=['Tanggal_DT', 'Urutan'])
-            
-            st.info("💡 Data telah diurutkan secara otomatis (Tanggal, lalu urutan asli dari PDF).")
         except Exception as e:
             st.warning(f"Gagal mengurutkan tanggal: {e}")
 
