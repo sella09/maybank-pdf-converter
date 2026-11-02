@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA Table Mode)")
+st.title("🏦 Bank PDF → Excel Converter (BCA Fix)")
 
 def to_float_indo_bca(s):
     if not s: return None
@@ -14,7 +14,7 @@ def to_float_indo_bca(s):
         return float(clean)
     except: return None
 
-def parse_bca_tables(file_obj, password=None):
+def parse_bca_final(file_obj, password=None):
     transactions = []
     pdf_args = {"password": password} if password else {}
     
@@ -25,67 +25,86 @@ def parse_bca_tables(file_obj, password=None):
         if match_thn: tahun = match_thn.group(1)
 
         for page in pdf.pages:
-            # Gunakan mode "text" karena PDF ini tidak punya garis tabel yang jelas
-            tables = page.extract_tables({
-                "vertical_strategy": "text",
-                "horizontal_strategy": "text",
-                "text_tolerance": 3,  # Toleransi spasi lebih besar
-                "intersection_tolerance": 15
-            })
+            words = page.extract_words()
             
-            if not tables: continue
+            # Tentukan batas X untuk memisahkan kolom
+            # Kolom Tanggal (kiri), Keterangan (tengah), Mutasi (kanan), Saldo (paling kanan)
+            # Nilai ini bisa disesuaikan jika PDF-nya beda
+            x_tanggal = page.width * 0.15
+            x_keterangan = page.width * 0.60
+            x_mutasi = page.width * 0.75
             
-            for table in tables:
-                for row in table:
-                    row = [(str(c).replace("\n", " ").strip() if c else "") for c in row]
-                    
-                    if len(row) < 4: continue
-                    
-                    # Cari sel yang berisi format tanggal DD/MM
-                    date_idx = -1
-                    for i, cell in enumerate(row):
-                        if re.match(r"^\d{2}/\d{2}$", cell):
-                            date_idx = i
-                            break
-                    
-                    if date_idx == -1: continue
-                    
-                    tgl_bulan = row[date_idx]
-                    keterangan = row[date_idx+1] if len(row) > date_idx+1 else ""
-                    
-                    # Gabungkan sisa teks di kanan tanggal
-                    for i in range(date_idx+2, len(row)):
-                        if row[i]:
-                            keterangan += " " + row[i]
-                    
-                    # Ekstrak angka dari seluruh baris
-                    numbers = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*\.\d{2}", " ".join(row))
-                    
-                    debit, kredit, saldo = None, None, None
-                    
-                    if len(numbers) >= 2:
-                        nominal = to_float_indo_bca(numbers[-2])
-                        saldo = to_float_indo_bca(numbers[-1])
-                        if "DB" in " ".join(row).upper(): kredit = nominal
-                        else: debit = nominal
-                    elif len(numbers) == 1:
-                        nominal = to_float_indo_bca(numbers[0])
-                        if "DB" in " ".join(row).upper(): kredit = nominal
-                        else: debit = nominal
-                    
-                    # Bersihkan keterangan
-                    for n in numbers: keterangan = keterangan.replace(n, "")
-                    keterangan = re.sub(r"\bDB\b", "", keterangan, flags=re.IGNORECASE)
-                    keterangan = " ".join(keterangan.split())
+            # Kelompokkan kata berdasarkan baris (Y)
+            lines = {}
+            for w in words:
+                y_key = round(w['top'] / 5) * 5
+                if y_key not in lines:
+                    lines[y_key] = []
+                lines[y_key].append(w)
 
-                    transactions.append({
-                        "Tanggal": f"{tgl_bulan}/{tahun}",
-                        "Kode": "-",
-                        "Keterangan": keterangan,
-                        "Debit": debit,
-                        "Kredit": kredit,
-                        "Saldo": saldo
-                    })
+            for y, word_list in sorted(lines.items()):
+                word_list.sort(key=lambda w: w['x0'])
+                
+                text_tanggal = ""
+                text_keterangan = ""
+                text_mutasi = ""
+                text_saldo = ""
+                
+                for w in word_list:
+                    if w['x0'] < x_tanggal:
+                        text_tanggal += w['text'] + " "
+                    elif w['x0'] < x_keterangan:
+                        text_keterangan += w['text'] + " "
+                    elif w['x0'] < x_mutasi:
+                        text_mutasi += w['text'] + " "
+                    else:
+                        text_saldo += w['text'] + " "
+                
+                # Cek apakah ini baris transaksi baru (diawali DD/MM)
+                match = re.match(r"^(\d{2}/\d{2})", text_tanggal.strip())
+                if not match: continue
+                
+                tgl_bulan = match.group(1)
+                keterangan = " ".join(text_keterangan.split()).strip()
+                mutasi = text_mutasi.strip()
+                saldo_str = text_saldo.strip()
+                
+                # Gabungkan jika ada teks yang terpotong (misal "SAL DO AWAL")
+                if "SAL" in keterangan and "DO AWAL" in text_mutasi:
+                    keterangan = "SALDO AWAL"
+                    mutasi = ""
+                if "PAJ" in keterangan and "AK BUNGA" in text_mutasi:
+                    keterangan = "PAJAK BUNGA"
+                if "BUN" in keterangan and "GA" in text_mutasi:
+                    keterangan = "BUNGA"
+
+                # Ekstrak angka dari mutasi dan saldo
+                numbers_mutasi = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*\.\d{2}", mutasi)
+                numbers_saldo = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*\.\d{2}", saldo_str)
+                
+                debit, kredit, saldo = None, None, None
+                
+                if numbers_mutasi:
+                    nominal = to_float_indo_bca(numbers_mutasi[0])
+                    if "DB" in mutasi.upper(): kredit = nominal
+                    else: debit = nominal
+                
+                if numbers_saldo:
+                    saldo = to_float_indo_bca(numbers_saldo[-1])
+                
+                # Bersihkan keterangan dari angka
+                for n in numbers_mutasi: keterangan = keterangan.replace(n, "")
+                keterangan = re.sub(r"\bDB\b", "", keterangan, flags=re.IGNORECASE)
+                keterangan = " ".join(keterangan.split()).strip()
+
+                transactions.append({
+                    "Tanggal": f"{tgl_bulan}/{tahun}",
+                    "Kode": "-",
+                    "Keterangan": keterangan,
+                    "Debit": debit,
+                    "Kredit": kredit,
+                    "Saldo": saldo
+                })
     return transactions
 
 def build_df(transactions, sumber_file):
@@ -116,7 +135,7 @@ if uploaded_files:
     for uploaded_file in uploaded_files:
         try:
             st.info(f"Memproses **{uploaded_file.name}**...")
-            txns = parse_bca_tables(uploaded_file, password=password)
+            txns = parse_bca_final(uploaded_file, password=password)
             df = build_df(txns, uploaded_file.name)
             
             if not df.empty:
