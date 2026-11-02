@@ -13,13 +13,12 @@ st.title("🏦 Bank PDF → Excel Converter")
 def to_float_indo_bca(s):
     if not s: return None
     try: 
-        # Hapus semua karakter selain angka, minus, dan titik
         clean = re.sub(r"[^\d.-]", "", s)
         return float(clean)
     except: return None
 
 # ==========================================
-# PARSER BCA (Versi 13.0 - Universal)
+# PARSER BCA (Versi 14.0 - Pembersih Total)
 # ==========================================
 def parse_bca_pdf(file_obj, password=None):
     transactions = []
@@ -44,10 +43,11 @@ def parse_bca_pdf(file_obj, password=None):
         if idx_awal != -1:
             all_text = all_text[idx_awal:]
 
-        # 4. Bersihkan Teks Sampah (Header/Footer BCA)
+        # 4. Bersihkan Teks Sampah (Header/Footer BCA) - Sangat Agresif
         # Hapus teks dari "Bersambung" sampai akhir baris atau "TANGGAL"
         all_text = re.sub(r"Bersambung.*?(TANGGAL|$)", "", all_text, flags=re.DOTALL|re.IGNORECASE)
         all_text = re.sub(r"REKENING GIRO.*?(MATA UANG : IDR|INDONESIA)", "", all_text, flags=re.DOTALL|re.IGNORECASE)
+        all_text = re.sub(r"TANGGAL\s+KETERANGAN\s+CBG\s+MUTASI\s+SALDO", "", all_text, flags=re.IGNORECASE)
         
         # 5. Gabungkan baris yang terpotong
         lines = all_text.split("\n")
