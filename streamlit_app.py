@@ -18,7 +18,7 @@ def to_float_indo_bca(s):
     except: return None
 
 # ==========================================
-# PARSER BCA (Versi 10.0 - Anti Gagal)
+# PARSER BCA (Versi 11.0 - Pembersih Agresif)
 # ==========================================
 def parse_bca_pdf(file_obj, password=None):
     transactions = []
@@ -33,7 +33,7 @@ def parse_bca_pdf(file_obj, password=None):
             if text:
                 all_text += text + "\n"
 
-        # 2. Cari Tahun dari "PERIODE : JANUARI 2026"
+        # 2. Cari Tahun
         match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", all_text, re.IGNORECASE)
         if match_thn: 
             tahun = match_thn.group(1)
@@ -43,7 +43,11 @@ def parse_bca_pdf(file_obj, password=None):
         if idx_awal != -1:
             all_text = all_text[idx_awal:]
 
-        # 4. Gabungkan baris yang terpotong
+        # 4. Bersihkan Teks Sampah (Header/Footer BCA)
+        all_text = re.sub(r"Bersambung ke halaman berikut.*?(SALDO|MUTASI|$)", "", all_text, flags=re.DOTALL|re.IGNORECASE)
+        all_text = re.sub(r"REKENING GIRO.*?(MATA UANG : IDR|INDONESIA)", "", all_text, flags=re.DOTALL|re.IGNORECASE)
+
+        # 5. Gabungkan baris yang terpotong
         lines = all_text.split("\n")
         merged_lines = []
         current_line = ""
@@ -61,7 +65,7 @@ def parse_bca_pdf(file_obj, password=None):
 
         if current_line: merged_lines.append(current_line)
 
-        # 5. Ekstrak Data
+        # 6. Ekstrak Data
         urutan = 0
         for line in merged_lines:
             match = re.match(r"^(\d{2}/\d{2})(.*)", line)
@@ -70,10 +74,9 @@ def parse_bca_pdf(file_obj, password=None):
             tgl_bulan = match.group(1)
             content = match.group(2).strip()
             
-            # Abaikan baris Saldo Awal atau teks sampah
             if "SALDO AWAL" in content.upper(): continue
             
-            # Cari semua angka desimal .xx
+            # Cari semua angka desimal (Wajib pakai titik/koma ribuan)
             amounts = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*[,.]\d{2}", content)
             
             saldo = None
@@ -82,33 +85,31 @@ def parse_bca_pdf(file_obj, password=None):
             desc = content
 
             if len(amounts) >= 1:
-                # Angka paling akhir PASTI Saldo
+                # Angka terakhir adalah Saldo
                 saldo_str = amounts[-1]
                 saldo = to_float_indo_bca(saldo_str)
                 desc = desc.replace(saldo_str, "")
                 
                 if len(amounts) >= 2:
-                    # Angka sebelumnya PASTI Mutasi
+                    # Angka sebelum saldo adalah Mutasi
                     nominal_str = amounts[-2]
                     nominal = to_float_indo_bca(nominal_str)
                     desc = desc.replace(nominal_str, "")
                     
-                    # Tentukan Debit/Kredit (Sesuai permintaanmu yang terbalik)
+                    # Sesuai permintaanmu sebelumnya: Debit/Kredit ditukar
                     if "DB" in content.upper():
                         kredit = nominal
                     else:
                         debit = nominal
             
-            # Bersihkan Deskripsi (Hapus kata 'DB' dan angka yang nyasar)
+            # Bersihkan Deskripsi dari sisa-sisa kode referensi dan kata 'DB'
             desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
-            desc = re.sub(r"\b\d{4}/\w+/\w+\b", "", desc) # Hapus kode referensi panjang
+            desc = re.sub(r"\b\d{4}/\w+/\w+\b", "", desc) 
             desc = " ".join(desc.split()).strip(" ,-")
             
-            # Jika deskripsi kosong atau cuma kode, skip
             if not desc and debit is None and kredit is None:
                 continue
 
-            # Konversi Tanggal ke format DD/MM/YYYY
             tgl_full = f"{tgl_bulan}/{tahun}"
             urutan += 1
 
@@ -173,10 +174,8 @@ if uploaded_files:
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
         
-        # FITUR URUTKAN
         try:
             final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
-            # Urutkan berdasarkan tanggal, JIKA sama lihat urutan aslinya
             final_df = final_df.sort_values(by=['Tanggal_DT', 'Urutan'])
             final_df = final_df.drop(columns=['Tanggal_DT', 'Urutan'])
         except Exception as e:
