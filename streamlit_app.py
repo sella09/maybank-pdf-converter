@@ -13,12 +13,13 @@ st.title("🏦 Bank PDF → Excel Converter")
 def to_float_indo_bca(s):
     if not s: return None
     try: 
+        # Hapus semua karakter selain angka, minus, dan titik
         clean = re.sub(r"[^\d.-]", "", s)
         return float(clean)
     except: return None
 
 # ==========================================
-# PARSER BCA (Versi 11.0 - Pembersih Agresif)
+# PARSER BCA (Versi 13.0 - Universal)
 # ==========================================
 def parse_bca_pdf(file_obj, password=None):
     transactions = []
@@ -33,7 +34,7 @@ def parse_bca_pdf(file_obj, password=None):
             if text:
                 all_text += text + "\n"
 
-        # 2. Cari Tahun
+        # 2. Cari Tahun dari "PERIODE : JANUARI 2026"
         match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", all_text, re.IGNORECASE)
         if match_thn: 
             tahun = match_thn.group(1)
@@ -44,9 +45,10 @@ def parse_bca_pdf(file_obj, password=None):
             all_text = all_text[idx_awal:]
 
         # 4. Bersihkan Teks Sampah (Header/Footer BCA)
-        all_text = re.sub(r"Bersambung ke halaman berikut.*?(SALDO|MUTASI|$)", "", all_text, flags=re.DOTALL|re.IGNORECASE)
+        # Hapus teks dari "Bersambung" sampai akhir baris atau "TANGGAL"
+        all_text = re.sub(r"Bersambung.*?(TANGGAL|$)", "", all_text, flags=re.DOTALL|re.IGNORECASE)
         all_text = re.sub(r"REKENING GIRO.*?(MATA UANG : IDR|INDONESIA)", "", all_text, flags=re.DOTALL|re.IGNORECASE)
-
+        
         # 5. Gabungkan baris yang terpotong
         lines = all_text.split("\n")
         merged_lines = []
@@ -76,7 +78,7 @@ def parse_bca_pdf(file_obj, password=None):
             
             if "SALDO AWAL" in content.upper(): continue
             
-            # Cari semua angka desimal (Wajib pakai titik/koma ribuan)
+            # Cari semua angka desimal (mendukung titik dan koma)
             amounts = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*[,.]\d{2}", content)
             
             saldo = None
@@ -91,20 +93,19 @@ def parse_bca_pdf(file_obj, password=None):
                 desc = desc.replace(saldo_str, "")
                 
                 if len(amounts) >= 2:
-                    # Angka sebelum saldo adalah Mutasi
+                    # Angka sebelumnya adalah Nominal Mutasi
                     nominal_str = amounts[-2]
                     nominal = to_float_indo_bca(nominal_str)
                     desc = desc.replace(nominal_str, "")
                     
-                    # Sesuai permintaanmu sebelumnya: Debit/Kredit ditukar
+                    # Sesuai permintaanmu: Debit/Kredit ditukar
                     if "DB" in content.upper():
                         kredit = nominal
                     else:
                         debit = nominal
             
-            # Bersihkan Deskripsi dari sisa-sisa kode referensi dan kata 'DB'
+            # Bersihkan Deskripsi
             desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
-            desc = re.sub(r"\b\d{4}/\w+/\w+\b", "", desc) 
             desc = " ".join(desc.split()).strip(" ,-")
             
             if not desc and debit is None and kredit is None:
@@ -174,6 +175,7 @@ if uploaded_files:
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
         
+        # FITUR URUTKAN
         try:
             final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
             final_df = final_df.sort_values(by=['Tanggal_DT', 'Urutan'])
