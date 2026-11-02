@@ -7,9 +7,6 @@ from io import BytesIO
 st.set_page_config(page_title="Bank PDF to Excel", layout="wide")
 st.title("🏦 Bank PDF → Excel Converter")
 
-# ==========================================
-# FUNGSI BANTUAN
-# ==========================================
 def to_float_indo_bca(s):
     if not s: return None
     try: 
@@ -17,120 +14,84 @@ def to_float_indo_bca(s):
         return float(clean)
     except: return None
 
-# ==========================================
-# PARSER BCA (Versi 14.0 - Pembersih Total)
-# ==========================================
-def parse_bca_pdf(file_obj, password=None):
+def parse_bca_tables(file_obj, password=None):
     transactions = []
     pdf_args = {"password": password} if password else {}
     
     with pdfplumber.open(file_obj, **pdf_args) as pdf:
         tahun = "2026"
-        # 1. Ambil Teks Mentah
-        all_text = ""
+        page1_text = pdf.pages[0].extract_text() or ""
+        match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", page1_text, re.IGNORECASE)
+        if match_thn: tahun = match_thn.group(1)
+
         for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                all_text += text + "\n"
-
-        # 2. Cari Tahun dari "PERIODE : JANUARI 2026"
-        match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", all_text, re.IGNORECASE)
-        if match_thn: 
-            tahun = match_thn.group(1)
-
-        # 3. Potong teks hanya dari "SALDO AWAL" ke bawah
-        idx_awal = all_text.upper().find("SALDO AWAL")
-        if idx_awal != -1:
-            all_text = all_text[idx_awal:]
-
-        # 4. Bersihkan Teks Sampah (Header/Footer BCA) - Sangat Agresif
-        # Hapus teks dari "Bersambung" sampai akhir baris atau "TANGGAL"
-        all_text = re.sub(r"Bersambung.*?(TANGGAL|$)", "", all_text, flags=re.DOTALL|re.IGNORECASE)
-        all_text = re.sub(r"REKENING GIRO.*?(MATA UANG : IDR|INDONESIA)", "", all_text, flags=re.DOTALL|re.IGNORECASE)
-        all_text = re.sub(r"TANGGAL\s+KETERANGAN\s+CBG\s+MUTASI\s+SALDO", "", all_text, flags=re.IGNORECASE)
-        
-        # 5. Gabungkan baris yang terpotong
-        lines = all_text.split("\n")
-        merged_lines = []
-        current_line = ""
-        
-        for line in lines:
-            line = line.strip()
-            if not line: continue
-            
-            # Baris baru jika diawali DD/MM
-            if re.match(r"^\d{2}/\d{2}", line):
-                if current_line: merged_lines.append(current_line)
-                current_line = line
-            else:
-                if current_line: current_line += " " + line
-
-        if current_line: merged_lines.append(current_line)
-
-        # 6. Ekstrak Data
-        urutan = 0
-        for line in merged_lines:
-            match = re.match(r"^(\d{2}/\d{2})(.*)", line)
-            if not match: continue
-            
-            tgl_bulan = match.group(1)
-            content = match.group(2).strip()
-            
-            if "SALDO AWAL" in content.upper(): continue
-            
-            # Cari semua angka desimal (mendukung titik dan koma)
-            amounts = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*[,.]\d{2}", content)
-            
-            saldo = None
-            debit = None
-            kredit = None
-            desc = content
-
-            if len(amounts) >= 1:
-                # Angka terakhir adalah Saldo
-                saldo_str = amounts[-1]
-                saldo = to_float_indo_bca(saldo_str)
-                desc = desc.replace(saldo_str, "")
-                
-                if len(amounts) >= 2:
-                    # Angka sebelumnya adalah Nominal Mutasi
-                    nominal_str = amounts[-2]
-                    nominal = to_float_indo_bca(nominal_str)
-                    desc = desc.replace(nominal_str, "")
-                    
-                    # Sesuai permintaanmu: Debit/Kredit ditukar
-                    if "DB" in content.upper():
-                        kredit = nominal
-                    else:
-                        debit = nominal
-            
-            # Bersihkan Deskripsi
-            desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
-            desc = " ".join(desc.split()).strip(" ,-")
-            
-            if not desc and debit is None and kredit is None:
-                continue
-
-            tgl_full = f"{tgl_bulan}/{tahun}"
-            urutan += 1
-
-            transactions.append({
-                "Urutan": urutan,
-                "Tanggal": tgl_full,
-                "Kode": "-",
-                "Keterangan": desc,
-                "Debit": debit,
-                "Kredit": kredit,
-                "Saldo": saldo
+            # Gunakan mode "lines" untuk mendeteksi garis tabel
+            tables = page.extract_tables({
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines"
             })
             
+            if not tables: continue
+            
+            for table in tables:
+                for row in table:
+                    # Bersihkan sel dari None dan newline
+                    row = [(str(c).replace("\n", " ").strip() if c else "") for c in row]
+                    
+                    if len(row) < 4: continue
+                    
+                    # Cari sel yang berisi format tanggal DD/MM
+                    date_idx = -1
+                    for i, cell in enumerate(row):
+                        if re.match(r"^\d{2}/\d{2}$", cell):
+                            date_idx = i
+                            break
+                    
+                    if date_idx == -1: continue
+                    
+                    tgl_bulan = row[date_idx]
+                    keterangan = row[date_idx+1] if len(row) > date_idx+1 else ""
+                    
+                    # Gabungkan sisa teks di kanan tanggal jika tabel terpecah
+                    for i in range(date_idx+2, len(row)):
+                        if row[i]:
+                            keterangan += " " + row[i]
+                    
+                    # Ekstrak angka dari seluruh baris
+                    numbers = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*\.\d{2}", " ".join(row))
+                    
+                    debit, kredit, saldo = None, None, None
+                    mutasi_str = " ".join(row)
+                    
+                    if len(numbers) >= 2:
+                        nominal = to_float_indo_bca(numbers[-2])
+                        saldo = to_float_indo_bca(numbers[-1])
+                        if "DB" in mutasi_str.upper(): kredit = nominal
+                        else: debit = nominal
+                    elif len(numbers) == 1:
+                        nominal = to_float_indo_bca(numbers[0])
+                        if "DB" in mutasi_str.upper(): kredit = nominal
+                        else: debit = nominal
+                    
+                    # Bersihkan keterangan
+                    for n in numbers: keterangan = keterangan.replace(n, "")
+                    keterangan = re.sub(r"\bDB\b", "", keterangan, flags=re.IGNORECASE)
+                    keterangan = " ".join(keterangan.split())
+
+                    transactions.append({
+                        "Tanggal": f"{tgl_bulan}/{tahun}",
+                        "Kode": "-",
+                        "Keterangan": keterangan,
+                        "Debit": debit,
+                        "Kredit": kredit,
+                        "Saldo": saldo
+                    })
     return transactions
 
-def build_df_bca(transactions, sumber_file):
+def build_df(transactions, sumber_file):
     rows = []
     for txn in transactions:
         rows.append({
-            "Urutan": txn["Urutan"],
             "Sumber File": sumber_file,
             "Tanggal": txn["Tanggal"],
             "Kode": txn["Kode"],
@@ -141,11 +102,8 @@ def build_df_bca(transactions, sumber_file):
         })
     return pd.DataFrame(rows)
 
-# ==========================================
-# UI STREAMLIT
-# ==========================================
+# UI
 col1, col2, col3 = st.columns(3)
-
 with col1:
     bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
 with col2:
@@ -158,8 +116,8 @@ if uploaded_files:
     for uploaded_file in uploaded_files:
         try:
             st.info(f"Memproses **{uploaded_file.name}**...")
-            txns = parse_bca_pdf(uploaded_file, password=password)
-            df = build_df_bca(txns, uploaded_file.name)
+            txns = parse_bca_tables(uploaded_file, password=password)
+            df = build_df(txns, uploaded_file.name)
             
             if not df.empty:
                 all_dfs.append(df)
@@ -175,11 +133,10 @@ if uploaded_files:
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
         
-        # FITUR URUTKAN
         try:
             final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
-            final_df = final_df.sort_values(by=['Tanggal_DT', 'Urutan'])
-            final_df = final_df.drop(columns=['Tanggal_DT', 'Urutan'])
+            final_df = final_df.sort_values(by=['Tanggal_DT'])
+            final_df = final_df.drop(columns=['Tanggal_DT'])
         except Exception as e:
             st.warning(f"Gagal mengurutkan tanggal: {e}")
 
