@@ -117,7 +117,6 @@ def parse_bca_perfect(file_obj, password=None):
     return transactions
 
 def parse_maybank_statement(file_obj, password=None):
-    # Parser untuk Maybank (dapat disesuaikan jika format e-statement Maybank memiliki pola khusus)
     transactions = []
     pdf_args = {"password": password} if password else {}
     
@@ -136,7 +135,6 @@ def parse_maybank_statement(file_obj, password=None):
         
         match_date = re.search(r"(\d{2}[/-]\d{2}[/-]\d{4}|\d{2}[/-]\d{2})", line_str)
         if match_date:
-            # Contoh struktur dasar baris Maybank (bisa disesuaikan dengan format PDF Maybank Anda)
             transactions.append({
                 "Tanggal": match_date.group(1),
                 "Kode": "-",
@@ -200,7 +198,16 @@ if uploaded_files:
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
         
-        st.subheader("📊 Preview Data (Hasil Konversi & Swap)")
+        # PERBAIKAN URUTAN BULAN (KRONOLOGIS):
+        try:
+            final_df['Tanggal'] = final_df['Tanggal'].astype(str).str.strip()
+            final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
+            final_df = final_df.sort_values(by=['Tanggal_DT'], ascending=True).reset_index(drop=True)
+            final_df = final_df.drop(columns=['Tanggal_DT'])
+        except Exception as e:
+            st.warning(f"Gagal mengurutkan tanggal secara otomatis: {e}")
+
+        st.subheader("📊 Preview Data (Urut Kronologis & Hasil Swap)")
         st.dataframe(final_df, use_container_width=True)
         
         output = BytesIO()
@@ -209,7 +216,7 @@ if uploaded_files:
         processed_data = output.getvalue()
         
         st.download_button(
-            label="📥 Download Excel Hasil Swap",
+            label="📥 Download Excel Hasil Swap & Urut",
             data=processed_data,
             file_name="mutasi_bank_swapped.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
