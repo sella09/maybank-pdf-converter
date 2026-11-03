@@ -4,85 +4,109 @@ import pandas as pd
 import re
 from io import BytesIO
 
-st.set_page_config(page_title="Bank PDF to Excel", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA Fixed)")
+st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Fixed)")
 
-def to_float_indo_bca(s):
-    if not s: return None
-    try: 
-        clean = re.sub(r"[^\d.-]", "", s)
-        return float(clean)
-    except: return None
-
-def parse_bca_final(file_obj, password=None):
+def parse_bca_perfect(file_obj, password=None):
     transactions = []
     pdf_args = {"password": password} if password else {}
     
     with pdfplumber.open(file_obj, **pdf_args) as pdf:
-        tahun = "2026"
-        page1_text = pdf.pages[0].extract_text() or ""
-        match_thn = re.search(r"PERIODE\s*:\s*\w+\s+(\d{4})", page1_text, re.IGNORECASE)
-        if match_thn: tahun = match_thn.group(1)
-
+        full_text = ""
         for page in pdf.pages:
-            words = page.extract_words()
-            
-            # Kelompokkan kata berdasarkan baris (Y)
-            lines = {}
-            for w in words:
-                y_key = round(w['top'] / 5) * 5
-                if y_key not in lines:
-                    lines[y_key] = []
-                lines[y_key].append(w)
+            t = page.extract_text()
+            if t:
+                full_text += t + "\n"
 
-            for y, word_list in sorted(lines.items()):
-                # Urutkan kata dari kiri ke kanan
-                word_list.sort(key=lambda w: w['x0'])
-                
-                # Gabungkan semua teks di baris ini
-                full_text = " ".join([w['text'] for w in word_list])
-                
-                # Cek apakah baris ini diawali tanggal DD/MM
-                # Kadang ada karakter aneh sebelum tanggal, jadi kita cari tanggal di mana saja
-                date_match = re.search(r"(\d{2}/\d{2})", full_text)
-                if not date_match: continue
-                
-                tgl_bulan = date_match.group(1)
-                
-                # Ambil semua angka desimal di baris ini
-                numbers = re.findall(r"-?\d{1,3}(?:[,.]\d{3})*\.\d{2}", full_text)
-                
-                # Hapus tanggal dan angka dari teks untuk mendapatkan keterangan
-                desc = full_text
-                desc = desc.replace(tgl_bulan, "") # Hapus tanggal
-                for n in numbers: desc = desc.replace(n, "") # Hapus angka
-                desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE) # Hapus kata DB
-                
-                # Perbaiki teks yang terpotong
-                desc = desc.replace("TRS F", "TRSF").replace("E-B ANKING", "E-BANKING").replace("SW ITCHING", "SWITCHING")
-                desc = " ".join(desc.split()).strip() # Rapikan spasi
+    lines = full_text.split('\n')
+    
+    # Deteksi Tahun & Periode
+    tahun = "2026"
+    match_thn = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", full_text, re.IGNORECASE)
+    if match_thn:
+        tahun = match_thn.group(1)
 
-                debit, kredit, saldo = None, None, None
-                
-                if len(numbers) >= 2:
-                    # Angka terakhir adalah Saldo, sebelumnya Nominal
-                    nominal = to_float_indo_bca(numbers[-2])
-                    saldo = to_float_indo_bca(numbers[-1])
-                    if "DB" in full_text.upper(): kredit = nominal
-                    else: debit = nominal
-                elif len(numbers) == 1:
-                    nominal = to_float_indo_bca(numbers[0])
-                    if "DB" in full_text.upper(): kredit = nominal
-                    else: debit = nominal
+    raw_txns = []
+    current_tx = None
+    
+    # Pattern Tanggal BCA: DD/MM di awal baris
+    date_pattern = re.compile(r"^(\d{2}/\d{2})\s+(.+)")
 
-                transactions.append({
-                    "Tanggal": f"{tgl_bulan}/{tahun}",
-                    "Kode": "-",
-                    "Keterangan": desc,
-                    "Debit": debit,
-                    "Kredit": kredit,
-                    "Saldo": saldo
-                })
+    for line in lines:
+        line_str = line.strip()
+        
+        # Abaikan baris header / footer bawaan PDF BCA
+        if not line_str or any(header_text in line_str for header_text in [
+            "TANGGAL KETERANGAN", "Bersambung ke", "SALDO AWAL", "NO. REKENING",
+            "REKENING GIRO", "HALAMAN", "PERIODE", "MATA UANG", "CATATAN:"
+        ]):
+            continue
+
+        m_date = date_pattern.match(line_str)
+        if m_date:
+            if current_tx:
+                raw_txns.append(current_tx)
+            current_tx = {
+                "tgl": m_date.group(1),
+                "text_lines": [m_date.group(2)]
+            }
+        elif current_tx:
+            # Menggabungkan baris lanjutan deskripsi transaksi
+            current_tx["text_lines"].append(line_str)
+
+    if current_tx:
+        raw_txns.append(current_tx)
+
+    # Parsing detail tiap blok transaksi
+    for tx in raw_txns:
+        combined = " ".join(tx["text_lines"])
+        
+        # Ekstrak semua format angka nominal (contoh: 1,000,000.00 atau 1000000.00)
+        amounts = re.findall(r"([\d,]+\.\d{2})\s*(DB)?", combined, flags=re.IGNORECASE)
+        
+        if not amounts:
+            continue
+
+        # Pasangan angka terakhir biasanya adalah (Nominal Mutasi, Saldo)
+        # Ambil nilai mutasi dan penanda DB (Debet)
+        mutasi_str, is_db_flag = amounts[-1][0], amounts[-1][1].upper() == 'DB'
+        
+        nominal = float(mutasi_str.replace(',', ''))
+        
+        # Ambil Saldo jika tersedia
+        saldo = None
+        if len(amounts) >= 2:
+            saldo = float(amounts[-1][0].replace(',', ''))
+            mutasi_str, is_db_flag = amounts[-2][0], amounts[-2][1].upper() == 'DB'
+            nominal = float(mutasi_str.replace(',', ''))
+
+        # Bersihkan deskripsi dari angka nominal dan bendera DB
+        desc = combined
+        for amt_tuple in amounts:
+            desc = desc.replace(amt_tuple[0], "")
+        desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
+        desc = " ".join(desc.split()).strip()
+
+        # LOGIKA PEMBALIKAN (SWAP):
+        # Asli DB (Debet/Pengeluaran BCA)  -> Pindah ke KREDIT (atau kolom Debet Swap)
+        # Asli CR (Kredit/Pemasukan BCA) -> Pindah ke DEBET (atau kolom Kredit Swap)
+        if is_db_flag:
+            debit = 0.0
+            kredit = nominal
+        else:
+            debit = nominal
+            kredit = 0.0
+
+        transactions.append({
+            "Tanggal": f"{tx['tgl']}/{tahun}",
+            "Kode": "-",
+            "Keterangan": desc,
+            "Debit": debit,
+            "Kredit": kredit,
+            "Saldo": saldo,
+            "Tipe Mutasi Asli": "DB" if is_db_flag else "CR"
+        })
+
     return transactions
 
 def build_df(transactions, sumber_file):
@@ -95,11 +119,12 @@ def build_df(transactions, sumber_file):
             "Keterangan": txn["Keterangan"],
             "Debit": txn["Debit"],
             "Kredit": txn["Kredit"],
-            "Saldo": txn["Saldo"]
+            "Saldo": txn["Saldo"],
+            "Tipe Asli": txn.get("Tipe Mutasi Asli", "-")
         })
     return pd.DataFrame(rows)
 
-# UI
+# Interface Streamlit
 col1, col2, col3 = st.columns(3)
 with col1:
     bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
@@ -113,17 +138,23 @@ if uploaded_files:
     for uploaded_file in uploaded_files:
         try:
             st.info(f"Memproses **{uploaded_file.name}**...")
-            txns = parse_bca_final(uploaded_file, password=password)
+            
+            if bank_choice == "BCA":
+                txns = parse_bca_perfect(uploaded_file, password=password)
+            else:
+                # Tambahkan fungsi parser Maybank jika diperlukan
+                txns = parse_bca_perfect(uploaded_file, password=password)
+                
             df = build_df(txns, uploaded_file.name)
             
             if not df.empty:
                 all_dfs.append(df)
-                st.success(f"✅ {uploaded_file.name}: {len(df)} transaksi")
+                st.success(f"✅ {uploaded_file.name}: {len(df)} transaksi berhasil diekstrak.")
             else:
-                st.warning(f"⚠️ {uploaded_file.name}: tidak ada transaksi terdeteksi.")
+                st.warning(f"⚠️ {uploaded_file.name}: Tidak ada transaksi terdeteksi.")
                 
         except Exception as e:
-            st.error(f"❌ **{uploaded_file.name}**: {type(e).__name__}")
+            st.error(f"❌ Error saat memproses **{uploaded_file.name}**: {type(e).__name__}")
             with st.expander("Lihat detail error"):
                 st.exception(e)
 
@@ -132,22 +163,22 @@ if uploaded_files:
         
         try:
             final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
-            final_df = final_df.sort_values(by=['Tanggal_DT'])
-            final_df = final_df.drop(columns=['Tanggal_DT'])
+            final_df = final_df.sort_values(by=['Tanggal_DT']).drop(columns=['Tanggal_DT'])
         except Exception as e:
             st.warning(f"Gagal mengurutkan tanggal: {e}")
 
-        st.subheader("📊 Preview Data")
-        st.dataframe(final_df, width='stretch')
+        st.subheader("📊 Preview Data Hasil Swap")
+        st.dataframe(final_df, use_container_width=True)
         
+        # Ekspor Ke Excel
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            final_df.to_excel(writer, index=False, sheet_name='Mutasi')
+            final_df.to_excel(writer, index=False, sheet_name='Mutasi_Swapped')
         processed_data = output.getvalue()
         
         st.download_button(
-            label="📥 Download sebagai Excel",
+            label="📥 Download Excel Hasil Swap",
             data=processed_data,
-            file_name="mutasi_gabungan.xlsx",
+            file_name="mutasi_bca_swapped.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
