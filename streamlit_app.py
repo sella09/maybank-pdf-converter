@@ -29,23 +29,20 @@ def open_pdf(file_obj, password=None):
         raise
 
 def to_float(num_str):
-    if num_str is None: return 0.0
+    if num_str is None or pd.isna(num_str): return 0.0
     s = str(num_str).strip()
     if not s or s in ("-", ""): return 0.0
-    # Bersihkan semua karakter selain angka, titik, dan koma
     s = re.sub(r"[^\d.,]", "", s)
     if not s: return 0.0
-    # Format Indonesia: 1.000.000,00 -> hapus titik, ganti koma jadi titik
     if re.search(r",\d{2}$", s) and "." in s:
         s = s.replace(".", "").replace(",", ".")
-    # Format lain: 1,000,000.00 -> hapus koma
     else:
         s = s.replace(",", "")
     try: return float(s)
     except ValueError: return 0.0
 
 def clean_desc(text):
-    if not text: return ""
+    if not text or pd.isna(text): return ""
     t = str(text)
     t = re.sub(r"Bersambung ke halaman berikut\.?", "", t, flags=re.I)
     t = re.sub(r"SALDO\s+AWAL\s*:.*?(SALDO\s+AKHIR\s*:.*)?", "", t, flags=re.I)
@@ -54,7 +51,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA
+# PARSER BCA (MENGGUNAKAN EXTRAK TABEL PDF)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -65,104 +62,85 @@ def parse_bca(file_bytes, password=None):
     order = 0
 
     for page in pdf.pages:
+        # Ambil Tahun
         if page.page_number == 1:
             text = page.extract_text() or ""
             m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", text, re.IGNORECASE)
             if m: tahun = m.group(1)
 
-        words = page.extract_words(keep_blank_chars=True)
-        lines = {}
-        for w in words:
-            y = round(w['top'], 1)
-            if y not in lines: lines[y] = []
-            lines[y].append(w)
-
-        current_txn = None
-
-        for y in sorted(lines.keys()):
-            row = sorted(lines[y], key=lambda w: w['x0'])
-            row_text = " ".join([w['text'] for w in row])
-
-            if any(k in row_text.upper() for k in ["REKENING GIRO", "KCIU RAWAMANGUN", "NO. REKENING", "PERIODE :", "MATA UANG", "CATATAN:", "BCA BERHAK"]):
-                continue
-
-            m_date = re.match(r"^(\d{2}/\d{2})\s+(.+)", row_text)
-            
-            if m_date:
-                if current_txn:
-                    current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
-                    transactions.append(current_txn)
-
-                tgl = m_date.group(1)
-                rest_text = m_date.group(2)
-
-                # Ekstrak angka format Indonesia (1.000.000,00 atau 1000000.00)
-                nums_raw = re.findall(r"\d{1,3}(?:\.\d{3})*,\d{2}|\d+\.\d{2}", rest_text)
-                nums = [to_float(n) for n in nums_raw]
-
-                # Bersihkan teks keterangan dari angka
-                desc_text = rest_text
-                for n in nums_raw:
-                    desc_text = desc_text.replace(n, "")
+        # EKSTRAK TABEL BCA
+        tables = page.extract_tables()
+        for table in tables:
+            for row in table:
+                if len(row) < 4: continue
                 
-                upper_desc = desc_text.upper()
+                # Cari tanggal
+                tgl_match = None
+                for cell in row:
+                    if cell and re.match(r"^\d{2}/\d{2}$", str(cell).strip()):
+                        tgl_match = str(cell).strip()
+                        break
+                
+                if not tgl_match: continue
 
-                # Tentukan Debit / Kredit
-                is_db = False
-                if any(k in upper_desc for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA", "TRSF E-BANKING DB"]):
-                    is_db = True
-                elif any(k in upper_desc for k in ["BI-FAST", "TRSF E-BANKING CR", "SETORAN TUNAI", "BUNGA"]):
-                    is_db = False
+                # Ambil teks utuh di baris ini
+                full_text = " ".join([str(c) for c in row if c])
+                
+                # Ekstrak angka (Nominal dan Saldo)
+                nums = re.findall(r"\d[\d,]*\.\d{2}", full_text)
+                parsed_nums = [to_float(n) for n in nums]
 
-                # Tentukan Nominal dan Saldo
-                if len(nums) >= 2:
-                    nominal = nums[0]
-                    saldo = nums[-1]
-                elif len(nums) == 1:
-                    nominal = nums[0]
+                if len(parsed_nums) == 0: 
+                    continue
+                elif len(parsed_nums) == 1:
+                    nominal = parsed_nums[0]
                     saldo = None
                 else:
-                    nominal = 0.0
-                    saldo = None
+                    nominal = parsed_nums[0]
+                    saldo = parsed_nums[-1]
 
+                # Logika Debit / Kredit
+                upper_text = full_text.upper()
+                is_db = False
+                if any(k in upper_text for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA", "TRSF E-BANKING DB"]):
+                    is_db = True
+                
                 debit_val = nominal if is_db else 0.0
                 kredit_val = nominal if not is_db else 0.0
 
-                # Khusus Bunga masuk Kredit
-                if "BUNGA" in upper_desc and "PAJAK" not in upper_desc:
-                    debit_val, kredit_val = 0.0, nominal
+                # Bersihkan Teks Keterangan
+                desc_text = full_text.replace(tgl_match, "")
+                for n in nums:
+                    desc_text = desc_text.replace(n, "")
+                desc_text = re.sub(r"\bDB\b|\bCR\b", "", desc_text, flags=re.I)
+                desc_text = clean_desc(desc_text)
 
-                current_txn = {
-                    "Tanggal": f"{tgl}/{tahun}",
+                transactions.append({
+                    "Tanggal": f"{tgl_match}/{tahun}",
                     "Kode": "-",
                     "Keterangan": desc_text,
                     "Debit": debit_val,
                     "Kredit": kredit_val,
                     "Saldo": saldo,
                     "_order": order,
-                }
+                })
                 order += 1
-
-            else:
-                if current_txn:
-                    # Ambil teks lanjutan, buang angka
-                    extra_text = re.sub(r"\d{1,3}(?:\.\d{3})*,\d{2}|\d+\.\d{2}", "", row_text)
-                    current_txn["Keterangan"] += " " + extra_text
-
-        if current_txn:
-            current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
-            transactions.append(current_txn)
-            current_txn = None
 
     pdf.close()
 
-    # Pembersihan akhir teks
+    # Validasi Matematika (Paksa benar jika ada selisih)
+    saldo_berjalan = 0.0
     for txn in transactions:
-        txn["Keterangan"] = clean_desc(txn["Keterangan"])
-        txn["Keterangan"] = re.sub(r"\bDB\b|\bCR\b", "", txn["Keterangan"]).strip()
-        txn["Keterangan"] = re.sub(r"\b\d{4}/[A-Z0-9/]+\b", "", txn["Keterangan"]).strip()
-        txn["Keterangan"] = " ".join(txn["Keterangan"].split())
+        if txn["Saldo"] is not None:
+            if saldo_berjalan != 0.0:
+                expected = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
+                if abs(expected - txn["Saldo"]) > 1.0:
+                    expected_swap = round(saldo_berjalan + txn["Debit"] - txn["Kredit"], 2)
+                    if abs(expected_swap - txn["Saldo"]) <= 1.0:
+                        txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"] # Tukar
+            saldo_berjalan = txn["Saldo"]
 
+    for txn in transactions:
         if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
         elif txn["Kredit"] > 0: txn["Tipe Asli"] = "CR"
         else: txn["Tipe Asli"] = "-"
@@ -265,7 +243,7 @@ if uploaded_files:
         final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
 
-        st.subheader("📊 Preview Data (Angka Rupiah Terbaca)")
+        st.subheader("📊 Preview Data (Bersih & Akurat)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
@@ -275,6 +253,6 @@ if uploaded_files:
         st.download_button(
             "📥 Download Excel",
             data=output.getvalue(),
-            file_name="mutasi_bank_indo_format.xlsx",
+            file_name="mutasi_bank_fixed_grid.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
