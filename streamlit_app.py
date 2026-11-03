@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Fixed Saldo & Layout)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Clean & Perfect)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -28,7 +28,6 @@ def parse_bca_perfect(file_obj, password=None):
 
     lines = full_text.split('\n')
     
-    # Keyword yang wajib diabaikan
     ignore_keywords = [
         "REKENING GIRO", "KCU", "DOMINIC DIGITAL", "KELAPA GADING", "JL BOULEVARD",
         "JAKARTA", "INDONESIA", "NO. REKENING", "HALAMAN", "PERIODE", "MATA UANG",
@@ -41,7 +40,6 @@ def parse_bca_perfect(file_obj, password=None):
         line_str = line.strip()
         if not line_str:
             continue
-        # Abaikan nomor halaman
         if re.match(r"^\d+\s*/\s*\d+$", line_str) or (re.match(r"^\d+$", line_str) and len(line_str) <= 3):
             continue
         if any(kw.lower() in line_str.lower() for kw in ignore_keywords):
@@ -70,12 +68,11 @@ def parse_bca_perfect(file_obj, password=None):
     for block in raw_blocks:
         combined_text = " ".join(block["lines"])
         
-        # 1. ABAIKAN BARIS SALDO AWAL
         if "SALDO AWAL" in combined_text.upper():
             continue
 
-        # Pattern untuk menangkap angka berformat mata uang BCA (misal: 666,000.00 / 14,749,133.34 / 50,000.00 DB)
-        pattern_amount = r"(\d{1,3}(?:,\d{3})+\.\d{2})\s*(DB)?"
+        # Tangkap semua angka berformat desimal (.00 atau .51 dsb) di baris tersebut
+        pattern_amount = r"([\d,]+\.\d{2})\s*(DB)?\s*(CR)?"
         matches = list(re.finditer(pattern_amount, combined_text, flags=re.IGNORECASE))
         
         if not matches:
@@ -86,56 +83,54 @@ def parse_bca_perfect(file_obj, password=None):
         is_db = False
         upper_text = combined_text.upper()
 
-        # 2. PENANGANAN TRANSAKSI KHUSUS (PAJAK BUNGA & BIAYA ADM)
         if "PAJAK BUNGA" in upper_text or "BIAYA ADM" in upper_text:
-            db_match = re.search(r"(\d{1,3}(?:,\d{3})+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
+            db_match = re.search(r"([\d,]+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
             if db_match:
                 nominal = float(db_match.group(1).replace(',', ''))
                 is_db = True
             if len(matches) >= 2:
                 saldo = float(matches[-1].group(1).replace(',', ''))
-        
-        # 3. PENANGANAN TRANSAKSI BUNGA
         elif "BUNGA" in upper_text and "PAJAK" not in upper_text:
-            bunga_match = re.search(r"(\d{1,3}(?:,\d{3})+\.\d{2})", combined_text)
+            bunga_match = re.search(r"([\d,]+\.\d{2})", combined_text)
             if bunga_match:
                 nominal = float(bunga_match.group(1).replace(',', ''))
             is_db = False
             if len(matches) >= 2:
                 saldo = float(matches[-1].group(1).replace(',', ''))
-                
-        # 4. TRANSAKSI NORMAL (TRANSFER / TERIMA DANA)
         else:
-            # BCA selalu meletakkan nilai MUTASI sebelum SALDO jika keduanya muncul di satu blok.
-            # Namun, kode referensi tanpa koma (misal: 600000.00) sering mengecoh regex standar.
-            # Di sini kita hanya mengambil angka berformat koma resmi.
-            
-            if len(matches) == 1:
-                # Hanya ada 1 angka berformat koma -> Ini PASTI nilai Mutasi Transaksi
-                nominal = float(matches[0].group(1).replace(',', ''))
-                if matches[0].group(2) and matches[0].group(2).upper() == 'DB':
-                    is_db = True
-                saldo = None
-            else:
-                # Ada 2 angka berformat koma -> Angka Pertama = Mutasi, Angka Kedua = Saldo
-                nominal = float(matches[0].group(1).replace(',', ''))
-                if matches[0].group(2) and matches[0].group(2).upper() == 'DB':
-                    is_db = True
-                saldo = float(matches[-1].group(1).replace(',', ''))
+            valid_amounts = []
+            for m in matches:
+                val_str = m.group(1).replace(',', '')
+                try:
+                    val = float(val_str)
+                    is_row_db = bool(m.group(2) and m.group(2).upper() == 'DB') or ("DB" in combined_text.upper() and len(matches) == 1)
+                    valid_amounts.append((val, is_row_db, m.group(0)))
+                except:
+                    pass
 
-        # Bersihkan deskripsi keterangan dari angka nominal
+            # Deteksi apakah baris ini bertuliskan DB di teksnya
+            if " DB" in upper_text or upper_text.endswith("DB"):
+                is_db = True
+
+            if len(valid_amounts) >= 2:
+                saldo = valid_amounts[-1][0]
+                nominal = valid_amounts[-2][0]
+                # Jika baris mengandung teks DB eksplisit
+                if " DB" in upper_text:
+                    is_db = True
+            elif len(valid_amounts) == 1:
+                nominal = valid_amounts[0][0]
+                is_db = valid_amounts[0][1]
+
+        # BERSIHKAN DESKRIPSI: Hapus semua angka nominal dan tag DB/CR dari teks keterangan
         desc = combined_text
         for m in matches:
             desc = desc.replace(m.group(0), "")
         
-        desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
+        desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.IGNORECASE)
         desc = " ".join(desc.split()).strip()
 
-        # ==========================================
         # LOGIKA SWAP (DEBET <-> KREDIT):
-        # - DB (Pengeluaran Asli BCA) -> Masuk KREDIT
-        # - CR (Pemasukan Asli BCA)   -> Masuk DEBET
-        # ==========================================
         if is_db:
             debit_val = 0.0
             kredit_val = nominal
@@ -246,7 +241,7 @@ if uploaded_files:
         except Exception as e:
             st.warning(f"Gagal mengurutkan tanggal secara otomatis: {e}")
 
-        st.subheader("📊 Preview Data (Sempurna & Rapi)")
+        st.subheader("📊 Preview Data (Bersih & Sempurna)")
         st.dataframe(final_df, use_container_width=True)
         
         output = BytesIO()
@@ -255,8 +250,8 @@ if uploaded_files:
         processed_data = output.getvalue()
         
         st.download_button(
-            label="📥 Download Excel Hasil Perbaikan",
+            label="📥 Download Excel Bersih & Sempurna",
             data=processed_data,
-            file_name="mutasi_bank_perfect_fixed.xlsx",
+            file_name="mutasi_bank_clean_final.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
