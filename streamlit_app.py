@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Absolute Final Fix)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Saldo Fix)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -87,7 +87,7 @@ def parse_bca_perfect(file_obj, password=None):
         nominal = 0.0
         saldo = None
 
-        # Cari seluruh angka berformat desimal (.XX) dalam baris
+        # Ambil semua angka berformat desimal di baris tersebut
         all_decimals = re.findall(r"([\d,]+\.\d{2})", combined_text)
         
         if not all_decimals:
@@ -103,21 +103,29 @@ def parse_bca_perfect(file_obj, password=None):
                 nominal = float(all_decimals[0].replace(',', ''))
             
             if len(all_decimals) >= 2:
-                saldo = float(all_decimals[-1].replace(',', ''))
+                saldo_val = float(all_decimals[-1].replace(',', ''))
+                if saldo_val != nominal:
+                    saldo = saldo_val
 
         # 2. BARIS BUNGA
         elif "BUNGA" in upper_text and "PAJAK" not in upper_text:
             is_db = False
             nominal = float(all_decimals[0].replace(',', ''))
             if len(all_decimals) >= 2:
-                saldo = float(all_decimals[-1].replace(',', ''))
+                saldo_val = float(all_decimals[-1].replace(',', ''))
+                if saldo_val != nominal:
+                    saldo = saldo_val
 
         # 3. TRANSAKSI NORMAL BCA
         else:
             if len(all_decimals) >= 2:
-                # Angka pertama adalah Mutasi, Angka terakhir adalah Saldo Akhir
                 nominal = float(all_decimals[0].replace(',', ''))
-                saldo = float(all_decimals[-1].replace(',', ''))
+                saldo_val = float(all_decimals[-1].replace(',', ''))
+                # Pastikan saldo tidak sama dengan nominal mutasi (mencegah duplikat)
+                if saldo_val != nominal:
+                    saldo = saldo_val
+                else:
+                    saldo = None
             elif len(all_decimals) == 1:
                 nominal = float(all_decimals[0].replace(',', ''))
                 saldo = None
@@ -246,7 +254,7 @@ if uploaded_files:
             final_df = final_df.sort_values(by=['Tanggal_DT'], ascending=True).reset_index(drop=True)
             final_df = final_df.drop(columns=['Tanggal_DT'])
 
-            st.subheader("📊 Preview Data (Absolute Correct Saldo & Tax)")
+            st.subheader("📊 Preview Data (Saldo Fixed)")
             st.dataframe(final_df, use_container_width=True)
             
             output = BytesIO()
@@ -255,9 +263,9 @@ if uploaded_files:
             processed_data = output.getvalue()
             
             st.download_button(
-                label="📥 Download Excel Fix Mutasi & Saldo",
+                label="📥 Download Excel Saldo & Pajak Bunga Fixed",
                 data=processed_data,
-                file_name="mutasi_bank_absolute_correct.xlsx",
+                file_name="mutasi_bank_correct_saldo.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         except Exception as e:
