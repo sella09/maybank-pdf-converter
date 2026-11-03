@@ -51,7 +51,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (DIPERBAIKI TOTAL)
+# PARSER BCA (TOTAL REWRITE)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -71,8 +71,6 @@ def parse_bca(file_bytes, password=None):
             if m_saldo: saldo_awal_global = to_float(m_saldo.group(1)) or 0.0
 
         words = page.extract_words(keep_blank_chars=True)
-        
-        # Kelompokkan berdasarkan Y (baris)
         lines = {}
         for w in words:
             y = round(w['top'], 1)
@@ -88,19 +86,32 @@ def parse_bca(file_bytes, password=None):
             if any(k in row_text.upper() for k in ["REKENING GIRO", "KCIU RAWAMANGUN", "NO. REKENING", "PERIODE :", "MATA UANG", "CATATAN:", "BCA BERHAK"]):
                 continue
 
-            # Deteksi awal transaksi (Tanggal DD/MM)
             m_date = re.match(r"^(\d{2}/\d{2})\s+(.+)", row_text)
             
             if m_date:
                 if current_txn:
-                    current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
                     transactions.append(current_txn)
 
                 tgl = m_date.group(1)
                 rest_text = m_date.group(2)
                 upper_rest = rest_text.upper()
 
-                # PISAHKAN NOMINAL DAN SALDO BERDASARKAN POSISI X
+                # Ekstrak HANYA teks yang berada di kolom paling kiri (Keterangan)
+                # Buang semua kata yang berformat tanggal (xx/xx) atau nominal (angka)
+                desc_words = []
+                for w in row:
+                    if w['x0'] < 350: # Batas kolom keterangan
+                        text_val = w['text']
+                        if not re.match(r"^\d{2}/\d{2}$", text_val) and not re.match(r"^\d[\d,]*\.\d{2}$", text_val):
+                            desc_words.append(text_val)
+                
+                desc_text = " ".join(desc_words)
+                desc_text = re.sub(r"\bDB\b|\bCR\b", "", desc_text, flags=re.I)
+                # Hapus teks acak seperti format referensi panjang agar lebih rapi
+                desc_text = re.sub(r"[A-Z0-9]{8,}", "", desc_text)
+                desc_text = " ".join(desc_text.split())
+
+                # Ekstrak Nominal & Saldo
                 nums = [w for w in row if re.match(r"^\d[\d,]*\.\d{2}$", w['text'])]
                 nums = sorted(nums, key=lambda w: w['x0'])
 
@@ -114,27 +125,15 @@ def parse_bca(file_bytes, password=None):
                     nominal = 0.0
                     saldo = None
 
-                # === LOGIKA DEBIT / KREDIT BCA YANG BENAR ===
+                # LOGIKA DEBIT / KREDIT BCA
                 is_db = False
-                # 1. Prioritas Utama: Kata Kunci DB
-                if any(k in upper_rest for k in ["EDDY SUFENDI", "TRSF E-BANKING DB", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "KR OTOMATIS", "ND-LAINNYA", "BYR VIA E-BANKING"]):
+                if any(k in upper_rest for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA"]):
                     is_db = True
-                # 2. Kata Kunci CR (Uang Masuk)
-                elif any(k in upper_rest for k in ["BI-FAST CR", "BI-FAST BIF TRANSFER DR", "TRSF E-BANKING CR", "SETORAN TUNAI", "BUNGA"]):
-                    is_db = False
-                # 3. Fallback
-                elif re.search(r"\bDB\b", upper_rest):
+                elif "TRSF E-BANKING DB" in upper_rest:
                     is_db = True
-                elif re.search(r"\bCR\b", upper_rest):
-                    is_db = False
-
+                
                 debit_val = nominal if is_db else 0.0
                 kredit_val = nominal if not is_db else 0.0
-
-                # Keterangan: Hanya ambil teks yang ada di kolom kiri (X < 400)
-                desc_words = [w['text'] for w in row if w['x0'] < 400 and not re.match(r"^\d[\d,]*\.\d{2}$", w['text'])]
-                desc_text = " ".join(desc_words)
-                desc_text = re.sub(r"\bDB\b|\bCR\b", "", desc_text, flags=re.I)
 
                 current_txn = {
                     "Tanggal": f"{tgl}/{tahun}",
@@ -148,34 +147,38 @@ def parse_bca(file_bytes, password=None):
                 order += 1
 
             else:
-                # Baris Lanjutan (Bukan Tanggal)
                 if current_txn:
-                    # Ambil teks di kolom kiri (X < 400) untuk melengkapi keterangan
-                    extra_words = [w['text'] for w in row if w['x0'] < 400 and not re.match(r"^\d[\d,]*\.\d{2}$", w['text'])]
+                    extra_words = []
+                    for w in row:
+                        if w['x0'] < 350:
+                            text_val = w['text']
+                            if not re.match(r"^\d{2}/\d{2}$", text_val) and not re.match(r"^\d[\d,]*\.\d{2}$", text_val):
+                                extra_words.append(text_val)
                     if extra_words:
-                        current_txn["Keterangan"] += " " + " ".join(extra_words)
+                        # Tambahkan ke keterangan tanpa merusak format
+                        extra_text = " ".join(extra_words)
+                        extra_text = re.sub(r"[A-Z0-9]{8,}", "", extra_text)
+                        current_txn["Keterangan"] += " " + extra_text
+                        current_txn["Keterangan"] = " ".join(current_txn["Keterangan"].split())
 
         if current_txn:
-            current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
             transactions.append(current_txn)
             current_txn = None
 
     pdf.close()
 
-    # === VALIDASI MATEMATIKA (Memastikan tidak ada yang kebalik) ===
+    # === VALIDASI MATEMATIKA (Kunci Anti Kebalik) ===
     saldo_berjalan = saldo_awal_global
     for txn in transactions:
         if txn["Saldo"] is None:
             txn["Saldo"] = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
             saldo_berjalan = txn["Saldo"]
         else:
-            # Cek hitungan normal
             expected = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
             if abs(expected - txn["Saldo"]) > 1.0:
-                # Jika tidak cocok, coba balik Debit/Kreditnya
                 expected_swap = round(saldo_berjalan + txn["Debit"] - txn["Kredit"], 2)
                 if abs(expected_swap - txn["Saldo"]) <= 1.0:
-                    txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"] # TUKAR!
+                    txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"] 
             saldo_berjalan = txn["Saldo"]
 
     for txn in transactions:
