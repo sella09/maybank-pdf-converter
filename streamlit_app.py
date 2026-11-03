@@ -4,8 +4,8 @@ import pandas as pd
 import re
 from io import BytesIO
 
-st.set_page_config(page_title="Bank PDF to Excel", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA Fixed & Perfected)")
+st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -27,17 +27,12 @@ def parse_bca_perfect(file_obj, password=None):
         tahun = match_thn.group(1)
 
     lines = full_text.split('\n')
-    
     raw_blocks = []
     current_block = None
-    
-    # Pattern Tanggal di awal baris: DD/MM
     date_pattern = re.compile(r"^(\d{2}/\d{2})\s+(.+)")
 
     for line in lines:
         line_str = line.strip()
-        
-        # Abaikan header, footer, dan ringkasan mutasi BCA di halaman terakhir
         if not line_str:
             continue
         if any(skip_kw in line_str.upper() for skip_kw in [
@@ -56,18 +51,13 @@ def parse_bca_perfect(file_obj, password=None):
                 "lines": [m_date.group(2)]
             }
         elif current_block:
-            # Baris lanjutan deskripsi/nominal
             current_block["lines"].append(line_str)
 
     if current_block:
         raw_blocks.append(current_block)
 
-    # Processing tiap blok transaksi
     for block in raw_blocks:
         combined_text = " ".join(block["lines"])
-        
-        # Cari semua pola angka mata uang desimal (contoh: 67,000,000.00 atau 1,315,426.17)
-        # Serta cek apakah angka diikuti kata "DB"
         pattern_amount = r"([\d,]+\.\d{2})\s*(DB)?"
         matches = list(re.finditer(pattern_amount, combined_text, flags=re.IGNORECASE))
         
@@ -78,35 +68,35 @@ def parse_bca_perfect(file_obj, password=None):
         nominal = 0.0
         is_db = False
 
-        if len(matches) >= 2:
-            # Match terakhir = SALDO
+        if "PAJAK BUNGA" in combined_text.upper() or "BIAYA ADM" in combined_text.upper():
+            db_match = re.search(r"([\d,]+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
+            if db_match:
+                nominal = float(db_match.group(1).replace(',', ''))
+                is_db = True
             saldo_str = matches[-1].group(1).replace(',', '')
             saldo = float(saldo_str)
-            
-            # Match kedua dari belakang = NOMINAL MUTASI
-            mutasi_match = matches[-2]
-            nominal = float(mutasi_match.group(1).replace(',', ''))
-            if mutasi_match.group(2) and mutasi_match.group(2).upper() == 'DB':
-                is_db = True
         else:
-            # Hanya ada 1 angka (Nominal saja tanpa Saldo)
-            mutasi_match = matches[0]
-            nominal = float(mutasi_match.group(1).replace(',', ''))
-            if mutasi_match.group(2) and mutasi_match.group(2).upper() == 'DB':
-                is_db = True
+            if len(matches) >= 2:
+                saldo_str = matches[-1].group(1).replace(',', '')
+                saldo = float(saldo_str)
+                mutasi_match = matches[-2]
+                nominal = float(mutasi_match.group(1).replace(',', ''))
+                if mutasi_match.group(2) and mutasi_match.group(2).upper() == 'DB':
+                    is_db = True
+            else:
+                mutasi_match = matches[0]
+                nominal = float(mutasi_match.group(1).replace(',', ''))
+                if mutasi_match.group(2) and mutasi_match.group(2).upper() == 'DB':
+                    is_db = True
 
-        # Hapus angka-angka nominal dan teks DB dari deskripsi keterangan
         desc = combined_text
         for m in matches:
             desc = desc.replace(m.group(0), "")
         
-        # Bersihkan kata DB yang tersisa & rapikan spasi
         desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
         desc = " ".join(desc.split()).strip()
 
-        # LOGIKA SWAP (Catatan Khusus):
-        # Transaksi DB (Debet Rekening Asli)  -> Dimasukkan ke Kolom KREDIT
-        # Transaksi CR (Kredit Rekening Asli) -> Dimasukkan ke Kolom DEBET
+        # Logika Swap Debet <-> Kredit
         if is_db:
             debet_swap = 0.0
             kredit_swap = nominal
@@ -126,6 +116,39 @@ def parse_bca_perfect(file_obj, password=None):
 
     return transactions
 
+def parse_maybank_statement(file_obj, password=None):
+    # Parser untuk Maybank (dapat disesuaikan jika format e-statement Maybank memiliki pola khusus)
+    transactions = []
+    pdf_args = {"password": password} if password else {}
+    
+    with pdfplumber.open(file_obj, **pdf_args) as pdf:
+        full_text = ""
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                full_text += t + "\n"
+
+    lines = full_text.split('\n')
+    for line in lines:
+        line_str = line.strip()
+        if not line_str:
+            continue
+        
+        match_date = re.search(r"(\d{2}[/-]\d{2}[/-]\d{4}|\d{2}[/-]\d{2})", line_str)
+        if match_date:
+            # Contoh struktur dasar baris Maybank (bisa disesuaikan dengan format PDF Maybank Anda)
+            transactions.append({
+                "Tanggal": match_date.group(1),
+                "Kode": "-",
+                "Keterangan": line_str,
+                "Debit": 0.0,
+                "Kredit": 0.0,
+                "Saldo": None,
+                "Tipe Asli": "CR"
+            })
+            
+    return transactions
+
 def build_df(transactions, sumber_file):
     rows = []
     for txn in transactions:
@@ -137,7 +160,7 @@ def build_df(transactions, sumber_file):
             "Debit": txn["Debit"],
             "Kredit": txn["Kredit"],
             "Saldo": txn["Saldo"],
-            "Tipe Asli BCA": txn["Tipe Asli"]
+            "Tipe Asli Bank": txn["Tipe Asli"]
         })
     return pd.DataFrame(rows)
 
@@ -155,7 +178,12 @@ if uploaded_files:
     for uploaded_file in uploaded_files:
         try:
             st.info(f"Memproses **{uploaded_file.name}**...")
-            txns = parse_bca_perfect(uploaded_file, password=password)
+            
+            if bank_choice == "BCA":
+                txns = parse_bca_perfect(uploaded_file, password=password)
+            else:
+                txns = parse_maybank_statement(uploaded_file, password=password)
+                
             df = build_df(txns, uploaded_file.name)
             
             if not df.empty:
@@ -172,13 +200,7 @@ if uploaded_files:
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
         
-        try:
-            final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
-            final_df = final_df.sort_values(by=['Tanggal_DT']).drop(columns=['Tanggal_DT'])
-        except Exception as e:
-            st.warning(f"Gagal mengurutkan tanggal: {e}")
-
-        st.subheader("📊 Preview Data (Hasil Pembalikan Debet/Kredit)")
+        st.subheader("📊 Preview Data (Hasil Konversi & Swap)")
         st.dataframe(final_df, use_container_width=True)
         
         output = BytesIO()
@@ -189,6 +211,6 @@ if uploaded_files:
         st.download_button(
             label="📥 Download Excel Hasil Swap",
             data=processed_data,
-            file_name="mutasi_bca_swapped.xlsx",
+            file_name="mutasi_bank_swapped.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
