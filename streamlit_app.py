@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Absolute Fix)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -71,7 +71,7 @@ def parse_bca_perfect(file_obj, password=None):
         if "SALDO AWAL" in combined_text.upper():
             continue
 
-        # Ekstrak semua angka desimal resmi (mendukung angka kecil seperti pajak bunga & angka besar)
+        # Ekstrak semua angka desimal resmi BCA
         pattern_amount = r"([\d,]+\.\d{2})\s*(DB)?\s*(CR)?"
         matches = list(re.finditer(pattern_amount, combined_text, flags=re.IGNORECASE))
         
@@ -115,27 +115,19 @@ def parse_bca_perfect(file_obj, password=None):
                 parsed_items.append({"val": val, "is_db": has_db_tag, "raw": m.group(0)})
 
             if len(parsed_items) >= 2:
-                # Algoritma Presisi BCA: 
-                # Saldo biasanya adalah angka terbesar atau angka terakhir di baris. 
-                # Namun jika ada 2 angka, angka mutasi adalah yang menempel dengan tag DB atau berada di posisi sebelum saldo.
-                # Kita pisahkan berdasarkan ukuran / posisi:
                 val1 = parsed_items[0]["val"]
                 val2 = parsed_items[1]["val"]
                 
                 if parsed_items[0]["is_db"] or parsed_items[1]["is_db"] or is_db:
-                    # Jika ada tag DB, pastikan nominal yang ber-tag DB diambil sebagai mutasi
                     if parsed_items[0]["is_db"]:
                         nominal = val1
                         saldo = val2
                         is_db = True
-                    elif parsed_items[1]["is_db"] or is_db:
-                        # Jika angka kedua ber-tag DB atau baris DB, angka pertama adalah saldo (atau sebaliknya)
-                        # Di BCA, mutasi ada di tengah, saldo di ujung kanan.
+                    else:
                         nominal = val1
                         saldo = val2
                         is_db = True
                 else:
-                    # Transaksi CR standar: Angka pertama mutasi, angka kedua saldo
                     nominal = val1
                     saldo = val2
             elif len(parsed_items) == 1:
@@ -152,11 +144,9 @@ def parse_bca_perfect(file_obj, password=None):
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.IGNORECASE)
         desc = " ".join(desc.split()).strip()
 
-        # ==========================================
         # LOGIKA SWAP (DEBET <-> KREDIT):
-        # - Asli DB (Pengeluaran) -> Masuk KREDIT
-        # - Asli CR (Pemasukan)   -> Masuk DEBET
-        # ==========================================
+        # Asli DB (Pengeluaran) -> Masuk KREDIT
+        # Asli CR (Pemasukan)   -> Masuk DEBET
         if is_db:
             debit_val = 0.0
             kredit_val = nominal
@@ -218,7 +208,7 @@ def build_df(transactions, sumber_file):
             "Debit": txn["Debit"],
             "Kredit": txn["Kredit"],
             "Saldo": txn["Saldo"],
-            "Tipe Asli Bank": txn["Tipe Asli"]
+            "Tipe Asli Bank": txn["Tippy Asli" if "Tippy Asli" in txn else "Tipe Asli"]
         })
     return pd.DataFrame(rows)
 
@@ -246,3 +236,38 @@ if uploaded_files:
             
             if not df.empty:
                 all_dfs.append(df)
+                st.success(f"✅ {uploaded_file.name}: {len(df)} transaksi terdeteksi.")
+            else:
+                st.warning(f"⚠️ {uploaded_file.name}: Tidak ada transaksi terdeteksi.")
+                
+        except Exception as e:
+            st.error(f"❌ Error saat memproses **{uploaded_file.name}**: {type(e).__name__}")
+            with st.expander("Lihat detail error"):
+                st.exception(e)
+
+    if all_dfs:
+        try:
+            final_df = pd.concat(all_dfs, ignore_index=True)
+            
+            # Pengurutan Kronologis dari Bulan Terkecil (Januari) ke Terbesar
+            final_df['Tanggal'] = final_df['Tanggal'].astype(str).str.strip()
+            final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
+            final_df = final_df.sort_values(by=['Tanggal_DT'], ascending=True).reset_index(drop=True)
+            final_df = final_df.drop(columns=['Tanggal_DT'])
+
+            st.subheader("📊 Preview Data (Sempurna & Urut)")
+            st.dataframe(final_df, use_container_width=True)
+            
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                final_df.to_excel(writer, index=False, sheet_name='Mutasi_Swapped')
+            processed_data = output.getvalue()
+            
+            st.download_button(
+                label="📥 Download Excel Sempurna",
+                data=processed_data,
+                file_name="mutasi_bank_final.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        except Exception as e:
+            st.error(f"Terjadi kesalahan saat menggabungkan data: {e}")
