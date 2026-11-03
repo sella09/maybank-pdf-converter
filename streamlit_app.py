@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Fully Fixed)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Final Tax Fix)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -71,7 +71,7 @@ def parse_bca_perfect(file_obj, password=None):
         if "SALDO AWAL" in combined_text.upper():
             continue
 
-        # Pattern untuk ekstrak angka desimal resmi BCA
+        # REGEX DIPERBAIKI: Mendukung angka dengan koma ribuan ATAU angka kecil di bawah 1.000 (seperti pajak bunga / bunga)
         pattern_amount = r"([\d,]+\.\d{2})\s*(DB)?\s*(CR)?"
         matches = list(re.finditer(pattern_amount, combined_text, flags=re.IGNORECASE))
         
@@ -83,42 +83,44 @@ def parse_bca_perfect(file_obj, password=None):
         is_db = False
         upper_text = combined_text.upper()
 
-        # Cek penanda DB eksplisit
         if " DB" in upper_text or "DB " in upper_text or upper_text.endswith("DB"):
             is_db = True
 
-        # 1. BARIS PAJAK BUNGA & BIAYA ADM
+        # 1. PENANGANAN PAJAK BUNGA & BIAYA ADM
         if "PAJAK BUNGA" in upper_text or "BIAYA ADM" in upper_text:
+            is_db = True
+            # Cari angka persis sebelum kata DB atau angka pertama di baris tersebut
             db_match = re.search(r"([\d,]+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
             if db_match:
                 nominal = float(db_match.group(1).replace(',', ''))
-                is_db = True
+            elif matches:
+                nominal = float(matches[0].group(1).replace(',', ''))
+            
             if len(matches) >= 2:
                 saldo = float(matches[-1].group(1).replace(',', ''))
         
-        # 2. BARIS BUNGA
+        # 2. PENANGANAN BUNGA
         elif "BUNGA" in upper_text and "PAJAK" not in upper_text:
-            bunga_match = re.search(r"([\d,]+\.\d{2})", combined_text)
-            if bunga_match:
-                nominal = float(bunga_match.group(1).replace(',', ''))
             is_db = False
+            if matches:
+                nominal = float(matches[0].group(1).replace(',', ''))
             if len(matches) >= 2:
                 saldo = float(matches[-1].group(1).replace(',', ''))
 
-        # 3. TRANSAKSI NORMAL (TRANSFER / TERIMA DANA)
+        # 3. TRANSAKSI NORMAL
         else:
-            # Ambil semua pasangan angka desimal yang terdeteksi
             parsed_items = []
             for m in matches:
-                val = float(m.group(1).replace(',', ''))
-                has_db_tag = bool(m.group(2) and m.group(2).upper() == 'DB')
-                parsed_items.append({"val": val, "is_db": has_db_tag, "raw": m.group(0)})
+                val_str = m.group(1).replace(',', '')
+                try:
+                    val = float(val_str)
+                    has_db_tag = bool(m.group(2) and m.group(2).upper() == 'DB')
+                    parsed_items.append({"val": val, "is_db": has_db_tag, "raw": m.group(0)})
+                except:
+                    pass
 
             if len(parsed_items) >= 2:
-                # Angka terakhir pada baris BCA selalu SALDO
                 saldo = parsed_items[-1]["val"]
-                
-                # Angka sebelum terakhir (atau yang berlabel DB) adalah NOMINAL MUTASI
                 if parsed_items[-2]["is_db"] or is_db:
                     nominal = parsed_items[-2]["val"]
                     is_db = True
@@ -130,7 +132,7 @@ def parse_bca_perfect(file_obj, password=None):
                     is_db = True
                 saldo = None
 
-        # Bersihkan deskripsi dari angka nominal dan tag DB/CR
+        # Bersihkan deskripsi keterangan
         desc = combined_text
         for m in matches:
             desc = desc.replace(m.group(0), "")
@@ -139,8 +141,8 @@ def parse_bca_perfect(file_obj, password=None):
         desc = " ".join(desc.split()).strip()
 
         # LOGIKA SWAP (DEBET <-> KREDIT):
-        # Transaksi Asli DB (Pengeluaran) -> Masuk KREDIT
-        # Transaksi Asli CR (Pemasukan)   -> Masuk DEBET
+        # Asli DB (Pengeluaran) -> Masuk KREDIT
+        # Asli CR (Pemasukan)   -> Masuk DEBET
         if is_db:
             debit_val = 0.0
             kredit_val = nominal
@@ -251,7 +253,7 @@ if uploaded_files:
         except Exception as e:
             st.warning(f"Gagal mengurutkan tanggal secara otomatis: {e}")
 
-        st.subheader("📊 Preview Data (Terurut Kronologis & Fixed)")
+        st.subheader("📊 Preview Data (Pajak Bunga & Bunga Lengkap)")
         st.dataframe(final_df, use_container_width=True)
         
         output = BytesIO()
@@ -260,8 +262,8 @@ if uploaded_files:
         processed_data = output.getvalue()
         
         st.download_button(
-            label="📥 Download Excel Perbaikan Final",
+            label="📥 Download Excel Lengkap Sempurna",
             data=processed_data,
-            file_name="mutasi_bank_swapped_perfect.xlsx",
+            file_name="mutasi_bank_final_complete.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
