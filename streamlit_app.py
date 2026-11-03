@@ -50,14 +50,14 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA
+# PARSER BCA (DIPERBAIKI)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
     transactions = []
     file_obj = BytesIO(file_bytes)
     pdf = open_pdf(file_obj, password)
-    
+
     full_text = ""
     for page in pdf.pages:
         t = page.extract_text()
@@ -83,12 +83,13 @@ def parse_bca(file_bytes, password=None):
             date_matches = re.findall(r"\b(\d{2}/\d{2})\b", context_before)
             tgl_pajak = date_matches[-1] if date_matches else None
             if tgl_pajak:
+                # Pemetaan Anda: uang keluar (DB) masuk kolom Kredit
                 transactions.append({
                     "Tanggal": f"{tgl_pajak}/{tahun}", "Kode": "-",
                     "Keterangan": "PAJAK BUNGA", "Debit": 0.0, "Kredit": pajak_val,
                     "Saldo": None, "Tipe Asli": "DB",
                 })
-    
+
     # 3. DETEKSI BUNGA GLOBAL
     for match in re.finditer(r"(?<!PAJAK\s)BUNGA\s+([\d,.]+)", full_text, re.IGNORECASE):
         start_check = max(0, match.start() - 20)
@@ -102,6 +103,7 @@ def parse_bca(file_bytes, password=None):
             date_matches = re.findall(r"\b(\d{2}/\d{2})\b", context_before)
             tgl_bunga = date_matches[-1] if date_matches else None
             if tgl_bunga:
+                # Pemetaan Anda: uang masuk (CR) masuk kolom Debit
                 transactions.append({
                     "Tanggal": f"{tgl_bunga}/{tahun}", "Kode": "-",
                     "Keterangan": "BUNGA", "Debit": bunga_val, "Kredit": 0.0,
@@ -110,15 +112,15 @@ def parse_bca(file_bytes, password=None):
 
     # 4. PARSE BARIS PER BARIS
     lines = full_text.split('\n')
-    
+
     ignore_keywords = [
         "REKENING GIRO", "KCU", "DOMINIC DIGITAL", "KELAPA GADING", "JL BOULEVARD",
         "JAKARTA", "INDONESIA", "NO. REKENING", "HALAMAN", "PERIODE", "MATA UANG",
         "CATATAN:", "Apabila nasabah", "BCA berhak", "TANGGAL KETERANGAN",
         "Bersambung ke halaman", "MUTASI CR :", "MUTASI DB :", "SALDO AKHIR :",
-        "===== Page", "# REKENING", "Page ", "- Page "
+        "SALDO AWAL", "===== Page", "# REKENING", "Page ", "- Page ",
     ]
-    
+
     clean_lines = []
     for line in lines:
         line_str = line.strip()
@@ -143,6 +145,13 @@ def parse_bca(file_bytes, password=None):
 
     if current_block: raw_blocks.append(current_block)
 
+    # Keyword yang menandakan uang KELUAR (DB) walau tidak ada label DB eksplisit
+    db_keywords = [
+        "EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA",
+        "TIGA MUSTIKA KONSU", "PT.FINNET", "PT. FINNET", "BA JASA E-BANKING",
+        "BIAYA TRANSFER", "BIAYA ADM", "BIAYA REFERENSI",
+    ]
+
     for block in raw_blocks:
         combined = " ".join(block["lines"])
         if "SALDO AWAL" in combined.upper(): continue
@@ -150,11 +159,12 @@ def parse_bca(file_bytes, password=None):
         upper = combined.upper()
         nums = re.findall(r"\d[\d,]*\.\d{2}", combined)
         if not nums: continue
-        
+
         num_vals = [to_float(n) for n in nums if to_float(n) is not None]
+        if not num_vals: continue
 
         # BIAYA ADM / TRANSFER / REFERENSI
-        if "BIAYA ADM" in upper or "BIAYA TRANSFER" in upper or "BIAYA REFERENSI" in upper:
+        if any(k in upper for k in ["BIAYA ADM", "BIAYA TRANSFER", "BIAYA REFERENSI"]):
             biaya_val = num_vals[0] if num_vals else 0.0
             saldo_val = None
             if len(num_vals) >= 2:
@@ -163,21 +173,30 @@ def parse_bca(file_bytes, password=None):
                     saldo_val = None
             transactions.append({
                 "Tanggal": f"{block['tgl']}/{tahun}", "Kode": "-",
-                "Keterangan": "BIAYA ADM", "Debit": 0.0, "Kredit": biaya_val,
+                "Keterangan": "BIAYA ADM",
+                # Pemetaan Anda: uang keluar → Kredit
+                "Debit": 0.0, "Kredit": biaya_val,
                 "Saldo": saldo_val, "Tipe Asli": "DB",
             })
             continue
 
-        # TRANSAKSI NORMAL
+        # TENTUKAN DB / CR
         is_db = False
-        if re.search(r"\bDB\b", upper): is_db = True
-        elif any(k in upper for k in ["EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA"]): is_db = True
+        if re.search(r"\bDB\b", upper):
+            is_db = True
+        elif any(k in upper for k in db_keywords):
+            is_db = True
+        # Kalau ada CR eksplisit dan tidak ada DB → CR
+        elif re.search(r"\bCR\b", upper):
+            is_db = False
 
         nominal = num_vals[0] if num_vals else 0.0
+
+        # Ambil SALDO dari PDF (angka terakhir jika berbeda & wajar)
         saldo = None
         if len(num_vals) >= 2:
             saldo_candidate = num_vals[-1]
-            if saldo_candidate > 100 and saldo_candidate != nominal:
+            if saldo_candidate != nominal and saldo_candidate > 1000:
                 saldo = saldo_candidate
 
         desc = combined
@@ -185,7 +204,9 @@ def parse_bca(file_bytes, password=None):
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
         desc = clean_desc(desc)
 
+        # PEMETAAN ANDA: DB (uang keluar) → Kredit ; CR (uang masuk) → Debit
         debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
+
         transactions.append({
             "Tanggal": f"{block['tgl']}/{tahun}", "Kode": "-", "Keterangan": desc,
             "Debit": debit_val, "Kredit": kredit_val,
@@ -193,12 +214,14 @@ def parse_bca(file_bytes, password=None):
         })
 
     # 5. HITUNG SALDO BERJALAN (RUNNING BALANCE)
+    # Karena pemetaan: Debit = uang masuk, Kredit = uang keluar
+    # maka saldo = saldo + Debit - Kredit
     transactions.sort(key=lambda x: x["Tanggal"])
-    
+
     saldo_berjalan = saldo_awal
     for txn in transactions:
         if txn["Saldo"] is None:
-            saldo_berjalan = saldo_berjalan + txn["Kredit"] - txn["Debit"]
+            saldo_berjalan = saldo_berjalan + txn["Debit"] - txn["Kredit"]
             txn["Saldo"] = saldo_berjalan
         else:
             saldo_berjalan = txn["Saldo"]
@@ -206,7 +229,7 @@ def parse_bca(file_bytes, password=None):
     return transactions
 
 # =========================================================
-# PARSER MAYBANK
+# PARSER MAYBANK (TETAP / TIDAK DIHAPUS)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_maybank(file_bytes, password=None):
@@ -215,7 +238,7 @@ def parse_maybank(file_bytes, password=None):
     pdf = open_pdf(file_obj, password)
     full_text = "".join([(p.extract_text() or "") + "\n" for p in pdf.pages])
     pdf.close()
-    
+
     lines = full_text.split("\n")
     date_re = re.compile(r"^(\d{2}[/-]\d{2}[/-]\d{4}|\d{2}[/-]\d{2})\b")
 
@@ -225,20 +248,21 @@ def parse_maybank(file_bytes, password=None):
         m = date_re.match(line_str)
         if not m: continue
         tgl = m.group(1)
-        
+
         nums = re.findall(r"\d[\d,]*\.\d{2}", line_str)
         parsed = [to_float(n) for n in nums if to_float(n) is not None]
         if not parsed: continue
-        
+
         nominal = parsed[0]
         saldo = parsed[-1] if len(parsed) >= 2 and parsed[-1] != nominal and parsed[-1] > 100 else None
         is_db = bool(re.search(r"\bDB\b", line_str.upper()))
-        
+
         desc = re.sub(r"^\d{2}[/-]\d{2}[/-]?\d{0,4}\s*", "", line_str)
         for n in nums: desc = desc.replace(n, "")
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
         desc = clean_desc(desc)
 
+        # Pemetaan konsisten: DB → Kredit, CR → Debit
         debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
         transactions.append({
             "Tanggal": tgl, "Kode": "-", "Keterangan": desc,
@@ -251,21 +275,21 @@ def parse_maybank(file_bytes, password=None):
 # UI STREAMLIT
 # =========================================================
 col1, col2, col3 = st.columns(3)
-with col1: 
+with col1:
     bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
-with col2: 
+with col2:
     password = st.text_input("🔑 Password PDF (jika ada)", type="password")
-with col3: 
+with col3:
     uploaded_files = st.file_uploader("📄 Pilih file PDF/TXT", type=["pdf", "txt"], accept_multiple_files=True)
 
 if uploaded_files:
     all_dfs = []
-    
+
     for uploaded_file in uploaded_files:
         try:
             st.info(f"Memproses **{uploaded_file.name}**...")
             file_bytes = uploaded_file.read()
-            
+
             if bank_choice == "BCA":
                 txns = parse_bca(file_bytes, password=password)
             else:
@@ -276,13 +300,13 @@ if uploaded_files:
                 "Keterangan": t["Keterangan"], "Debit": t["Debit"], "Kredit": t["Kredit"],
                 "Saldo": t["Saldo"], "Tipe Asli Bank": t["Tipe Asli"]
             } for t in txns])
-            
+
             if not df.empty:
                 all_dfs.append(df)
                 st.success(f"✅ {uploaded_file.name}: {len(df)} transaksi.")
             else:
                 st.warning(f"⚠️ {uploaded_file.name}: Tidak ada transaksi.")
-                
+
         except ValueError as ve:
             st.error(f"🔒 {uploaded_file.name}: {ve}")
         except Exception as e:
@@ -304,7 +328,7 @@ if uploaded_files:
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             final_df.to_excel(writer, index=False, sheet_name="Mutasi")
-        
+
         st.download_button(
             "📥 Download Excel",
             data=output.getvalue(),
