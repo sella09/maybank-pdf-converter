@@ -1,10 +1,7 @@
 import streamlit as st
 import pdfplumber
-import camelot
 import pandas as pd
 import re
-import os
-import tempfile
 import traceback
 from io import BytesIO
 
@@ -12,7 +9,7 @@ from io import BytesIO
 # KONFIGURASI HALAMAN
 # =========================================================
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA Camelot + Maybank)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank)")
 
 # =========================================================
 # HELPER FUNCTIONS
@@ -32,7 +29,6 @@ def open_pdf(file_obj, password=None):
         raise
 
 def to_float(num_str):
-    """Versi File 1 — return None kalau kosong (lebih aman untuk saldo)."""
     if num_str is None: return None
     s = str(num_str).strip()
     if not s or s in ("-", ""): return None
@@ -49,119 +45,148 @@ def clean_desc(text):
     if not text: return ""
     t = str(text)
     t = re.sub(r"Rekening ini sampai dengan akhir bulan berikutnya.*?Rekening ini\.", "", t, flags=re.I | re.S)
+    t = re.sub(r"CATATAN:.*?Rekening\.", "", t, flags=re.I | re.S)
     return " ".join(t.split()).strip()
 
-def extract_bca_header(file_bytes, password=None):
-    """Ambil tahun & saldo awal dari halaman 1 via pdfplumber (bukan Camelot)."""
-    tahun = "2026"
-    saldo_awal = 0.0
-    try:
-        pdf = open_pdf(BytesIO(file_bytes), password)
-        text = pdf.pages[0].extract_text() or ""
-        pdf.close()
-        m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", text, re.IGNORECASE)
-        if m: tahun = m.group(1)
-        m_saldo = re.search(r"SALDO\s+AWAL\s*[\n:]?\s*([\d,.]+)", text, re.IGNORECASE)
-        if m_saldo: saldo_awal = to_float(m_saldo.group(1)) or 0.0
-    except Exception:
-        pass
-    return tahun, saldo_awal
+# =========================================================
+# PARSER BCA — pdfplumber, keterangan UTUH, DB/CR DIPERBAIKI
+# =========================================================
+# Keyword yang PASTI Debit (uang keluar)
+DB_KEYWORDS = [
+    "EDDY SUFENDI", "EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET",
+    "PENERIMAAN NEGARA", "TIGA MUSTIKA KONSU", "PT.FINNET", "PT. FINNET",
+    "BA JASA E-BANKING", "BIAYA ADM", "BIAYA TRANSFER", "BIAYA REFERENSI",
+    "SWITCHING KE", "SWITCHING TRANSFER KE", "SWITCHING DB",
+    "BI-FAST BIF TRANSFER KE", "BI-FAST BIF BIAYA TXN KE",
+    "OTOMATIS", "FEE TELEX", "FEE FULL AMT", "FEE VALUE TDY",
+    "PAJAK BUNGA", "PEMBELIAN", "BY PASANG", "BAYAR",
+    "TRSF E-BANKING DB", "KR OTOMATIS", "ND-BIAYA ADM",
+    "ND-LAINNYA", "BYR VIA E-BANKING", "SETORAN TUNAI BAYAR TAGIHAN",
+]
+# Keyword yang PASTI Kredit (uang masuk)
+CR_KEYWORDS = [
+    "TRSF E-BANKING CR", "BI-FAST CR", "BI-FAST CRBIF", "KR OTOMATIS LLG",
+    "SETORAN TUNAI", "BUNGA",
+]
 
-# =========================================================
-# PARSER BCA — VERSI CAMELOT (File 2, sudah diperbaiki)
-# =========================================================
+def detect_dbcr(upper_text):
+    """Return True kalau DB (debit), False kalau CR (kredit)."""
+    # 1. Cek penanda eksplisit di teks
+    if re.search(r"\bDB\b", upper_text):
+        return True
+    if re.search(r"\bCR\b", upper_text):
+        return False
+    # 2. Cek keyword DB
+    if any(k in upper_text for k in DB_KEYWORDS):
+        return True
+    # 3. Cek keyword CR
+    if any(k in upper_text for k in CR_KEYWORDS):
+        return False
+    # 4. Default: CR (uang masuk) — BCA paling banyak CR
+    return False
+
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
-    tahun, saldo_awal = extract_bca_header(file_bytes, password)
+    transactions = []
+    file_obj = BytesIO(file_bytes)
+    pdf = open_pdf(file_obj, password)
 
-    # Simpan ke temp file (auto-delete)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    try:
-        tmp.write(file_bytes)
-        tmp.close()
+    tahun = "2026"
+    saldo_awal = 0.0
 
-        # Camelot butuh password lewat argumen kalau PDF terproteksi
-        camelot_kwargs = dict(pages='all', flavor='stream', edge_tol=100)
-        if password:
-            camelot_kwargs["password"] = password
+    for page in pdf.pages:
+        if page.page_number == 1:
+            text = page.extract_text() or ""
+            m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", text, re.IGNORECASE)
+            if m: tahun = m.group(1)
+            m_saldo = re.search(r"SALDO\s+AWAL\s*[\n:]?\s*([\d,.]+)", text, re.IGNORECASE)
+            if m_saldo: saldo_awal = to_float(m_saldo.group(1)) or 0.0
 
-        tables = camelot.read_pdf(tmp.name, **camelot_kwargs)
-        if not tables:
-            return []
+        words = page.extract_words(keep_blank_chars=True)
+        lines = {}
+        for w in words:
+            y = round(w['top'], 1)
+            if y not in lines: lines[y] = []
+            lines[y].append(w)
 
-        transactions = []
-        for table in tables:
-            df = table.df
-            for _, row in df.iterrows():
-                tgl_raw = str(row.iloc[0]).strip()
-                if not re.match(r"^\d{2}/\d{2}$", tgl_raw):
-                    continue
+        prev_txn = None  # untuk gabung keterangan lanjutan
 
-                row_text = " ".join(str(c) for c in row.tolist())
-                nums = re.findall(r"\d[\d,]*\.\d{2}", row_text)
+        for y in sorted(lines.keys()):
+            row = sorted(lines[y], key=lambda w: w['x0'])
+            row_text = " ".join([w['text'] for w in row])
 
-                # Bersihkan keterangan dari angka
-                desc = row_text
-                for n in nums:
-                    desc = desc.replace(n, "")
-                desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
-                desc = re.sub(r"^\d{2}/\d{2}\s*", "", desc)
-                desc = clean_desc(desc)
+            m_date = re.match(r"^(\d{2}/\d{2})\s+(.+)", row_text)
+            if not m_date:
+                # Baris lanjutan keterangan (tanpa tanggal) → gabung ke transaksi sebelumnya
+                if prev_txn is not None:
+                    extra = re.sub(r"^\d[\d,]*\.\d{2}\b", "", row_text).strip()
+                    extra = re.sub(r"[\d,]+\.\d{2}", "", extra).strip()
+                    extra = re.sub(r"\bDB\b|\bCR\b", "", extra, flags=re.I).strip()
+                    if extra:
+                        prev_txn["Keterangan"] = (prev_txn["Keterangan"] + " " + extra).strip()
+                continue
 
-                # Deteksi DB/CR
-                upper = row_text.upper()
+            tgl = m_date.group(1)
+            rest_text = m_date.group(2)
+
+            # Ambil angka & posisi X
+            nums = []
+            for w in row:
+                if re.match(r"^\d[\d,]*\.\d{2}$", w['text']):
+                    nums.append({"val": to_float(w['text']), "x": w['x0']})
+
+            if len(nums) < 1: continue
+
+            nums = sorted(nums, key=lambda n: n['x'])
+            nominal = nums[0]['val']
+            saldo = nums[-1]['val'] if len(nums) >= 2 else None
+            if saldo == nominal:
+                saldo = None
+
+            upper_rest = rest_text.upper()
+            is_db = detect_dbcr(upper_rest)
+
+            # === KETERANGAN UTUH ===
+            desc = rest_text
+            desc = re.sub(r"\b\d[\d,]*\.\d{2}\b", "", desc)  # buang angka
+            desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)  # buang DB/CR
+            desc = clean_desc(desc)
+
+            debit_val, kredit_val = (nominal, 0.0) if is_db else (0.0, nominal)
+
+            # Bunga masuk kredit
+            if "BUNGA" in upper_rest and "PAJAK" not in upper_rest:
+                debit_val, kredit_val = 0.0, nominal
                 is_db = False
-                if re.search(r"\bDB\b", upper):
-                    is_db = True
-                elif any(k in upper for k in [
-                    "EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA",
-                    "TIGA MUSTIKA KONSU", "PT.FINNET", "PT. FINNET", "BA JASA E-BANKING",
-                    "BIAYA ADM", "BIAYA TRANSFER", "BIAYA REFERENSI", "SWITCHING KE",
-                    "SWITCHING TRANSFER KE", "BI-FAST BIF TRANSFER KE", "BI-FAST BIF BIAYA TXN KE",
-                    "OTOMATIS", "FEE TELEX", "FEE FULL AMT", "FEE VALUE TDY", "PAJAK BUNGA",
-                    "PEMBELIAN", "BY PASANG", "BAYAR", "SWITCHING DB", "TRSF E-BANKING DB",
-                ]):
-                    is_db = True
 
-                nominal = to_float(nums[0]) if nums else 0.0
-                saldo = to_float(nums[-1]) if len(nums) > 1 and to_float(nums[-1]) != nominal else None
+            txn = {
+                "Tanggal": f"{tgl}/{tahun}",
+                "Kode": "-",
+                "Keterangan": desc,
+                "Debit": debit_val,
+                "Kredit": kredit_val,
+                "Saldo": saldo,
+                "Tipe Asli": "DB" if is_db else "CR",
+            }
+            transactions.append(txn)
+            prev_txn = txn
 
-                debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
+    pdf.close()
 
-                # Bunga masuk kredit
-                if "BUNGA" in upper and "PAJAK" not in upper:
-                    debit_val, kredit_val = nominal, 0.0
-                    is_db = False
-
-                transactions.append({
-                    "Tanggal": f"{tgl_raw}/{tahun}",
-                    "Kode": "-",
-                    "Keterangan": desc,
-                    "Debit": debit_val,
-                    "Kredit": kredit_val,
-                    "Saldo": saldo,
-                    "Tipe Asli": "DB" if is_db else "CR",
-                })
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except Exception:
-            pass
-
-    # Running balance kalau saldo kosong
+    # Sort & running balance
     transactions.sort(key=lambda x: x["Tanggal"])
     saldo_berjalan = saldo_awal
     for txn in transactions:
         if txn["Saldo"] is not None:
             saldo_berjalan = txn["Saldo"]
         else:
-            saldo_berjalan = saldo_berjalan + txn["Debit"] - txn["Kredit"]
+            saldo_berjalan = saldo_berjalan - txn["Debit"] + txn["Kredit"]
             txn["Saldo"] = round(saldo_berjalan, 2)
 
     return transactions
 
 # =========================================================
-# PARSER MAYBANK (dari File 1 — tidak diubah)
+# PARSER MAYBANK (tidak diubah)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_maybank(file_bytes, password=None):
@@ -194,7 +219,7 @@ def parse_maybank(file_bytes, password=None):
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
         desc = clean_desc(desc)
 
-        debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
+        debit_val, kredit_val = (nominal, 0.0) if is_db else (0.0, nominal)
         transactions.append({
             "Tanggal": tgl, "Kode": "-", "Keterangan": desc,
             "Debit": debit_val, "Kredit": kredit_val,
@@ -207,7 +232,7 @@ def parse_maybank(file_bytes, password=None):
 # =========================================================
 col1, col2, col3 = st.columns(3)
 with col1:
-    bank_choice = st.selectbox("Pilih Bank", ["BCA (Camelot)", "Maybank"])
+    bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
 with col2:
     password = st.text_input("🔑 Password PDF (jika ada)", type="password")
 with col3:
@@ -221,7 +246,7 @@ if uploaded_files:
             st.info(f"Memproses **{uploaded_file.name}**...")
             file_bytes = uploaded_file.read()
 
-            if bank_choice.startswith("BCA"):
+            if bank_choice == "BCA":
                 txns = parse_bca(file_bytes, password=password)
             else:
                 txns = parse_maybank(file_bytes, password=password)
@@ -253,7 +278,7 @@ if uploaded_files:
         final_df = final_df.drop(columns=["Tanggal_DT"])
         final_df = final_df[(final_df["Debit"] > 0) | (final_df["Kredit"] > 0)]
 
-        st.subheader("📊 Preview Data")
+        st.subheader("📊 Preview Data (Keterangan Utuh)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
@@ -263,6 +288,6 @@ if uploaded_files:
         st.download_button(
             "📥 Download Excel",
             data=output.getvalue(),
-            file_name="mutasi_bank_camelot_plus_maybank.xlsx",
+            file_name="mutasi_bank_fixed.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
