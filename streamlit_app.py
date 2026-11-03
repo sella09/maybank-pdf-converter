@@ -7,9 +7,6 @@ from io import BytesIO
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
 st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank)")
 
-# =========================================================
-# HELPER
-# =========================================================
 def open_pdf(file_obj, password=None):
     file_obj.seek(0)
     try:
@@ -20,224 +17,235 @@ def open_pdf(file_obj, password=None):
         msg = str(e).lower()
         if "password" in msg or "encrypt" in msg or "decrypt" in msg:
             if not password:
-                raise ValueError("PDF ini terproteksi password. Isi kolom 🔑 Password PDF.")
+                raise ValueError("PDF terproteksi. Isi kolom 🔑 Password.")
             raise ValueError("Password PDF salah.")
         raise
 
-
 def to_float(num_str):
-    """Konversi '1,234.56' / '1.234,56' / '1241.00' ke float."""
-    if num_str is None:
-        return None
+    if num_str is None: return None
     s = str(num_str).strip()
-    if not s or s in ("-", ""):
-        return None
-    # buang simbol mata uang & spasi
+    if not s or s in ("-", ""): return None
     s = re.sub(r"[^\d.,]", "", s)
-    if not s:
-        return None
-    # format Indonesia: 1.234,56
+    if not s: return None
     if re.search(r",\d{2}$", s) and "." in s:
         s = s.replace(".", "").replace(",", ".")
     else:
         s = s.replace(",", "")
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
+    try: return float(s)
+    except ValueError: return None
 
 def clean_desc(text):
-    """Bersihkan keterangan dari footer/noise BCA."""
-    if not text:
-        return ""
+    if not text: return ""
     t = str(text)
-    # buang kalimat footer BCA
-    t = re.sub(
-        r"Rekening ini sampai dengan akhir bulan berikutnya.*?Rekening ini\.",
-        "", t, flags=re.IGNORECASE | re.DOTALL,
-    )
+    t = re.sub(r"Rekening ini sampai dengan akhir bulan berikutnya.*?Rekening ini\.", "", t, flags=re.IGNORECASE | re.DOTALL)
     t = re.sub(r"telah menyetujui segala data.*?Rekening ini\.", "", t, flags=re.I | re.S)
-    # rapikan spasi
-    t = " ".join(t.split())
-    return t.strip()
-
+    return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (berbasis TABEL)
+# PARSER BCA (HYBRID: TABEL + TEKS FALLBACK)
 # =========================================================
-def parse_bca_perfect(file_obj, password=None):
+def parse_bca_hybrid(file_obj, password=None):
     transactions = []
     pdf = open_pdf(file_obj, password)
-    try:
-        # deteksi tahun dari teks
-        full_text = ""
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                full_text += t + "\n"
+    
+    # 1. DETEKSI TAHUN
+    full_text = ""
+    for page in pdf.pages:
+        t = page.extract_text()
+        if t: full_text += t + "\n"
+    
+    tahun = "2026"
+    m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", full_text, re.IGNORECASE)
+    if m: tahun = m.group(1)
 
-        tahun = "2026"
-        m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", full_text, re.IGNORECASE)
-        if m:
-            tahun = m.group(1)
+    # 2. COBA EKSTRAK TABEL (Untuk PDF Asli)
+    table_rows_found = 0
+    for page in pdf.pages:
+        tables = page.extract_tables()
+        for table in tables:
+            for row in table:
+                if not row: continue
+                cells = [clean_desc(c) if c else "" for c in row]
+                joined = " | ".join(cells)
+                
+                # cari tanggal DD/MM
+                tgl = None
+                for c in cells:
+                    mt = re.match(r"^(\d{2}/\d{2})\b", c)
+                    if mt:
+                        tgl = mt.group(1)
+                        break
+                if not tgl: continue
+                
+                row_text = re.sub(r"^\d{2}/\d{2}\s*", "", joined)
+                upper = row_text.upper()
+                if "SALDO AWAL" in upper: continue
 
-        # parse tabel per halaman
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
-                    if not row:
-                        continue
-                    # normalisasi cell
-                    cells = [clean_desc(c) if c else "" for c in row]
-                    # gabung semua cell untuk cek tanggal
-                    joined = " | ".join(cells)
+                is_db = bool(re.search(r"\bDB\b", upper))
+                is_cr = bool(re.search(r"\bCR\b", upper))
+                
+                if "PAJAK BUNGA" in upper or "BIAYA ADM" in upper:
+                    is_db, is_cr = True, False
+                elif "BUNGA" in upper and "PAJAK" not in upper:
+                    is_db, is_cr = False, True
 
-                    # cari tanggal DD/MM di cell pertama (atau mana saja)
-                    tgl = None
-                    for c in cells:
-                        mt = re.match(r"^(\d{2}/\d{2})\b", c)
-                        if mt:
-                            tgl = mt.group(1)
-                            break
-                    if not tgl:
-                        continue
+                decimals = re.findall(r"\d[\d,]*\.\d{2}", row_text)
+                if not decimals: continue
 
-                    # gabungkan seluruh teks baris (tanpa tanggal) untuk analisis
-                    row_text = " ".join(cells)
-                    # buang tanggal di awal
-                    row_text = re.sub(r"^\d{2}/\d{2}\s*", "", row_text)
+                nominal = to_float(decimals[0]) or 0.0
+                saldo = None
+                if len(decimals) >= 2:
+                    saldo_val = to_float(decimals[-1])
+                    if saldo_val is not None and saldo_val != nominal and saldo_val > 0:
+                        saldo = saldo_val
 
-                    upper = row_text.upper()
+                desc = row_text
+                for d in decimals: desc = desc.replace(d, "")
+                desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
+                desc = " ".join(desc.split()).strip()
 
-                    # skip baris saldo awal / header
-                    if "SALDO AWAL" in upper:
-                        continue
-                    if "TANGGAL" in upper and "KETERANGAN" in upper:
-                        continue
+                debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
 
-                    # --- deteksi arah mutasi (DB/CR) ---
-                    # Prioritas: cari token DB/CR yang berdiri sendiri
-                    is_db = bool(re.search(r"\bDB\b", upper))
-                    is_cr = bool(re.search(r"\bCR\b", upper))
+                transactions.append({
+                    "Tanggal": f"{tgl}/{tahun}", "Kode": "-", "Keterangan": desc,
+                    "Debit": debit_val, "Kredit": kredit_val,
+                    "Saldo": saldo, "Tipe Asli": "DB" if is_db else "CR",
+                })
+                table_rows_found += 1
 
-                    # kasus khusus
-                    if "PAJAK BUNGA" in upper or "BIAYA ADM" in upper:
-                        is_db = True
-                        is_cr = False
-                    elif "BUNGA" in upper and "PAJAK" not in upper:
-                        is_db = False
-                        is_cr = True
+    # 3. FALLBACK: PARSE TEKS MENTAH (Jika Tabel Kosong / File TXT)
+    if table_rows_found == 0:
+        lines = full_text.split('\n')
+        ignore_keywords = [
+            "REKENING GIRO", "KCU", "DOMINIC DIGITAL", "KELAPA GADING", "JL BOULEVARD",
+            "JAKARTA", "INDONESIA", "NO. REKENING", "HALAMAN", "PERIODE", "MATA UANG",
+            "CATATAN:", "Apabila nasabah", "BCA berhak", "TANGGAL KETERANGAN", 
+            "Bersambung ke halaman", "MUTASI CR :", "MUTASI DB :", "SALDO AKHIR :",
+            "===== Page", "# REKENING"
+        ]
+        
+        clean_lines = []
+        for line in lines:
+            line_str = line.strip()
+            if not line_str: continue
+            if re.match(r"^\d+\s*/\s*\d+$", line_str) or (re.match(r"^\d+$", line_str) and len(line_str) <= 3): continue
+            if any(kw.lower() in line_str.lower() for kw in ignore_keywords): continue
+            clean_lines.append(line_str)
 
-                    # jika tidak ada penanda, default CR (pemasukan) — tapi
-                    # cek kata kunci DB yang umum
-                    if not is_db and not is_cr:
-                        # cek keyword yang biasanya DB
-                        db_keywords = ["EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET",
-                                       "PENERIMAAN NEGARA", "BIAYA TRANSFER SME",
-                                       "BIAYA REFERENSI", "FEE TELEX", "FEE FULL",
-                                       "FEE VALUE", "TRANSFER OR VIA IB",
-                                       "SWITCHING DB", "BIF TRANSFER KE",
-                                       "PAJAK BUNGA", "BIAYA ADM"]
-                        if any(k in upper for k in db_keywords):
-                            is_db = True
+        raw_blocks = []
+        current_block = None
+        date_pattern = re.compile(r"^(\d{2}/\d{2})\s*(.+)")
 
-                    # --- ekstrak semua angka desimal ---
-                    # pola: 1,234,567.89 atau 1234567.89
-                    decimals = re.findall(r"\d[\d,]*\.\d{2}", row_text)
-                    if not decimals:
-                        continue
+        for line_str in clean_lines:
+            # Tanggal mungkin menempel dengan teks, misal: 01/07SALDO AWAL
+            m_date = date_pattern.match(line_str)
+            if m_date:
+                if current_block: raw_blocks.append(current_block)
+                current_block = {"tgl": m_date.group(1), "lines": [m_date.group(2)]}
+            elif current_block:
+                upper_line = line_str.upper()
+                if "BUNGA" in upper_line or "PAJAK BUNGA" in upper_line:
+                    raw_blocks.append(current_block)
+                    current_block = {"tgl": current_block["tgl"], "lines": [line_str]}
+                else:
+                    current_block["lines"].append(line_str)
 
-                    # nominal = angka pertama, saldo = angka terakhir (jika berbeda)
-                    nominal = to_float(decimals[0]) or 0.0
-                    saldo = None
-                    if len(decimals) >= 2:
-                        saldo_val = to_float(decimals[-1])
-                        # saldo valid jika berbeda dari nominal dan > 0
-                        if saldo_val is not None and saldo_val != nominal and saldo_val > 0:
-                            saldo = saldo_val
+        if current_block: raw_blocks.append(current_block)
 
-                    # --- bersihkan deskripsi ---
-                    desc = row_text
-                    for d in decimals:
-                        desc = desc.replace(d, "")
-                    # buang token DB/CR
-                    desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
-                    # buang kode referensi panjang (CBG, dll) — opsional
-                    desc = " ".join(desc.split()).strip()
-                    if not desc:
-                        desc = "(tanpa keterangan)"
+        for block in raw_blocks:
+            combined_text = " ".join(block["lines"])
+            if "SALDO AWAL" in combined_text.upper(): continue
 
-                    # --- SWAP: DB asli -> Kredit, CR asli -> Debit ---
-                    if is_db:
-                        debit_val = 0.0
-                        kredit_val = nominal
-                        tipe = "DB"
-                    else:
-                        debit_val = nominal
-                        kredit_val = 0.0
-                        tipe = "CR"
+            upper_text = combined_text.upper()
+            has_db = bool(re.search(r"\bDB\b", upper_text))
+            has_cr = bool(re.search(r"\bCR\b", upper_text))
 
-                    transactions.append({
-                        "Tanggal": f"{tgl}/{tahun}",
-                        "Kode": "-",
-                        "Keterangan": desc,
-                        "Debit": debit_val,
-                        "Kredit": kredit_val,
-                        "Saldo": saldo,
-                        "Tipe Asli": tipe,
-                    })
-    finally:
-        pdf.close()
+            # Perbaikan: Tangani format angka yang menempel (misal: 12345.67DB atau 12345.67CR)
+            # Dan pastikan regex membaca angka ribuan dengan benar
+            all_decimals = re.findall(r"[\d,]+\.\d{2}", combined_text)
+            if not all_decimals: continue
 
+            nominal = 0.0
+            saldo = None
+            is_db = False
+
+            if "PAJAK BUNGA" in upper_text or "BIAYA ADM" in upper_text:
+                is_db = True
+                db_match = re.search(r"([\d,]+\.\d{2})\s*DB", combined_text, flags=re.IGNORECASE)
+                if db_match: nominal = to_float(db_match.group(1)) or 0.0
+                else: nominal = to_float(all_decimals[0]) or 0.0
+                if len(all_decimals) >= 2:
+                    saldo_val = to_float(all_decimals[-1])
+                    if saldo_val is not None and saldo_val != nominal: saldo = saldo_val
+            elif "BUNGA" in upper_text and "PAJAK" not in upper_text:
+                is_db = False
+                nominal = to_float(all_decimals[0]) or 0.0
+                if len(all_decimals) >= 2:
+                    saldo_val = to_float(all_decimals[-1])
+                    if saldo_val is not None and saldo_val != nominal: saldo = saldo_val
+            else:
+                if len(all_decimals) >= 2:
+                    nominal = to_float(all_decimals[0]) or 0.0
+                    saldo_val = to_float(all_decimals[-1])
+                    if saldo_val is not None and saldo_val != nominal: saldo = saldo_val
+                elif len(all_decimals) == 1:
+                    nominal = to_float(all_decimals[0]) or 0.0
+                
+                if has_db: is_db = True
+                elif has_cr: is_db = False
+                else:
+                    # Cek keyword DB
+                    db_keywords = ["EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA", "BIAYA TRANSFER SME", "BIAYA REFERENSI", "FEE TELEX", "FEE FULL", "FEE VALUE", "TRANSFER OR VIA IB"]
+                    if any(k in upper_text for k in db_keywords): is_db = True
+
+            desc = combined_text
+            for num_str in all_decimals: desc = desc.replace(num_str, "")
+            desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.IGNORECASE)
+            desc = " ".join(desc.split()).strip()
+
+            debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
+
+            transactions.append({
+                "Tanggal": f"{block['tgl']}/{tahun}", "Kode": "-", "Keterangan": desc,
+                "Debit": debit_val, "Kredit": kredit_val,
+                "Saldo": saldo, "Tipe Asli": "DB" if is_db else "CR",
+            })
+
+    pdf.close()
     return transactions
 
-
 # =========================================================
-# PARSER MAYBANK (fallback sederhana)
+# PARSER MAYBANK (Fallback Sederhana)
 # =========================================================
 def parse_maybank_statement(file_obj, password=None):
+    # Sama seperti sebelumnya...
     transactions = []
     pdf = open_pdf(file_obj, password)
-    try:
-        full_text = ""
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                full_text += t + "\n"
-    finally:
-        pdf.close()
-
+    full_text = "".join([(p.extract_text() or "") + "\n" for p in pdf.pages])
+    pdf.close()
+    
     lines = full_text.split("\n")
     date_re = re.compile(r"^(\d{2}[/-]\d{2}[/-]\d{4}|\d{2}[/-]\d{2})\b")
 
     for line in lines:
         line_str = line.strip()
-        if not line_str:
-            continue
+        if not line_str: continue
         m = date_re.match(line_str)
-        if not m:
-            continue
+        if not m: continue
         tgl = m.group(1)
         nums = re.findall(r"\d[\d,]*\.\d{2}", line_str)
         parsed = [to_float(n) for n in nums if to_float(n) is not None]
-        if not parsed:
-            continue
+        if not parsed: continue
+        
         nominal = parsed[0]
         saldo = parsed[-1] if len(parsed) >= 2 and parsed[-1] != nominal else None
         is_db = bool(re.search(r"\bDB\b", line_str.upper()))
         desc = re.sub(r"^\d{2}[/-]\d{2}[/-]?\d{0,4}\s*", "", line_str)
-        for n in nums:
-            desc = desc.replace(n, "")
+        for n in nums: desc = desc.replace(n, "")
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
         desc = " ".join(desc.split()).strip()
 
-        if is_db:
-            debit_val, kredit_val = 0.0, nominal
-        else:
-            debit_val, kredit_val = nominal, 0.0
-
+        debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
         transactions.append({
             "Tanggal": tgl, "Kode": "-", "Keterangan": desc,
             "Debit": debit_val, "Kredit": kredit_val,
@@ -245,36 +253,20 @@ def parse_maybank_statement(file_obj, password=None):
         })
     return transactions
 
-
 # =========================================================
-# BUILD DF
+# BUILD DF & UI
 # =========================================================
 def build_df(transactions, sumber_file):
-    rows = []
-    for txn in transactions:
-        rows.append({
-            "Sumber File": sumber_file,
-            "Tanggal": txn["Tanggal"],
-            "Kode": txn["Kode"],
-            "Keterangan": txn["Keterangan"],
-            "Debit": txn["Debit"],
-            "Kredit": txn["Kredit"],
-            "Saldo": txn["Saldo"],
-            "Tipe Asli Bank": txn["Tipe Asli"],
-        })
-    return pd.DataFrame(rows)
+    return pd.DataFrame([{
+        "Sumber File": sumber_file, "Tanggal": t["Tanggal"], "Kode": t["Kode"],
+        "Keterangan": t["Keterangan"], "Debit": t["Debit"], "Kredit": t["Kredit"],
+        "Saldo": t["Saldo"], "Tipe Asli Bank": t["Tipe Asli"]
+    } for t in transactions])
 
-
-# =========================================================
-# UI
-# =========================================================
 col1, col2, col3 = st.columns(3)
-with col1:
-    bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
-with col2:
-    password = st.text_input("🔑 Password PDF (jika ada)", type="password")
-with col3:
-    uploaded_files = st.file_uploader("📄 Pilih file PDF", type=["pdf"], accept_multiple_files=True)
+with col1: bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
+with col2: password = st.text_input("🔑 Password PDF (jika ada)", type="password")
+with col3: uploaded_files = st.file_uploader("📄 Pilih file PDF", type=["pdf", "txt"], accept_multiple_files=True)
 
 if uploaded_files:
     all_dfs = []
@@ -282,7 +274,7 @@ if uploaded_files:
         try:
             st.info(f"Memproses **{uploaded_file.name}**...")
             if bank_choice == "BCA":
-                txns = parse_bca_perfect(uploaded_file, password=password)
+                txns = parse_bca_hybrid(uploaded_file, password=password)
             else:
                 txns = parse_maybank_statement(uploaded_file, password=password)
 
@@ -296,8 +288,7 @@ if uploaded_files:
             st.error(f"🔒 {uploaded_file.name}: {ve}")
         except Exception as e:
             st.error(f"❌ {uploaded_file.name}: {type(e).__name__}")
-            with st.expander("Detail error"):
-                st.exception(e)
+            with st.expander("Detail error"): st.exception(e)
 
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
@@ -313,8 +304,7 @@ if uploaded_files:
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             final_df.to_excel(writer, index=False, sheet_name="Mutasi_Swapped")
         st.download_button(
-            "📥 Download Excel",
-            data=output.getvalue(),
+            "📥 Download Excel", data=output.getvalue(),
             file_name="mutasi_bank_correct_saldo.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
