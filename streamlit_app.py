@@ -68,6 +68,40 @@ def parse_bca(file_bytes, password=None):
     m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", full_text, re.IGNORECASE)
     if m: tahun = m.group(1)
 
+    # --- LANGKAH 1: DETEKSI PAJAK BUNGA SECARA GLOBAL ---
+    # Karena di PDF BCA, PAJAK BUNGA sering menempel dengan BUNGA di satu baris.
+    # Kita deteksi dulu dengan regex global, lalu hapus dari teks agar tidak dobel.
+    pajak_pattern = re.compile(
+        r"BUNGA\s+([\d,.]+)\s+(?:CR|DB)?\s+PAJAK\s+BUNGA\s+([\d,.]+)\s+(?:CR|DB)?",
+        re.IGNORECASE
+    )
+    
+    for match in pajak_pattern.finditer(full_text):
+        bunga_val = to_float(match.group(1))
+        pajak_val = to_float(match.group(2))
+        
+        # Cari tanggal terdekat sebelum match
+        start_pos = match.start()
+        context_before = full_text[max(0, start_pos - 500):start_pos]
+        date_matches = re.findall(r"\b(\d{2}/\d{2})\b", context_before)
+        tgl_pajak = date_matches[-1] if date_matches else None
+        if not tgl_pajak:
+            continue
+        
+        if bunga_val:
+            transactions.append({
+                "Tanggal": f"{tgl_pajak}/{tahun}", "Kode": "-",
+                "Keterangan": "BUNGA", "Debit": bunga_val, "Kredit": 0.0,
+                "Saldo": None, "Tipe Asli": "CR",
+            })
+        if pajak_val:
+            transactions.append({
+                "Tanggal": f"{tgl_pajak}/{tahun}", "Kode": "-",
+                "Keterangan": "PAJAK BUNGA", "Debit": 0.0, "Kredit": pajak_val,
+                "Saldo": None, "Tipe Asli": "DB",
+            })
+
+    # --- LANGKAH 2: PARSE BARIS PER BARIS (TRANSAKSI NORMAL + BIAYA ADM) ---
     lines = full_text.split('\n')
     
     ignore_keywords = [
@@ -85,6 +119,8 @@ def parse_bca(file_bytes, password=None):
         if re.match(r"^\d+\s*/\s*\d+$", line_str): continue
         if re.match(r"^\d+$", line_str) and len(line_str) <= 3: continue
         if any(kw.lower() in line_str.lower() for kw in ignore_keywords): continue
+        # Skip baris yang sudah ditangkap pola PAJAK BUNGA global
+        if re.search(r"PAJAK\s+BUNGA", line_str, re.IGNORECASE): continue
         clean_lines.append(line_str)
 
     raw_blocks = []
@@ -97,15 +133,7 @@ def parse_bca(file_bytes, password=None):
             if current_block: raw_blocks.append(current_block)
             current_block = {"tgl": m_date.group(1), "lines": [m_date.group(2)]}
         elif current_block:
-            upper_line = line_str.upper()
-            if any(k in upper_line for k in ["PAJAK BUNGA", "BIAYA ADM", "BIAYA TRANSFER", "BIAYA REFERENSI"]):
-                raw_blocks.append(current_block)
-                current_block = {"tgl": current_block["tgl"], "lines": [line_str]}
-            elif "BUNGA" in upper_line and "PAJAK" not in upper_line:
-                raw_blocks.append(current_block)
-                current_block = {"tgl": current_block["tgl"], "lines": [line_str]}
-            else:
-                current_block["lines"].append(line_str)
+            current_block["lines"].append(line_str)
 
     if current_block: raw_blocks.append(current_block)
 
@@ -119,17 +147,7 @@ def parse_bca(file_bytes, password=None):
         
         num_vals = [to_float(n) for n in nums if to_float(n) is not None]
 
-        # PAJAK BUNGA
-        if "PAJAK BUNGA" in upper:
-            pajak_val = num_vals[0] if num_vals else 0.0
-            transactions.append({
-                "Tanggal": f"{block['tgl']}/{tahun}", "Kode": "-",
-                "Keterangan": "PAJAK BUNGA", "Debit": 0.0, "Kredit": pajak_val,
-                "Saldo": None, "Tipe Asli": "DB",
-            })
-            continue
-
-        # BUNGA
+        # --- BUNGA (biasanya sudah ditangkap pola global, tapi ini untuk jaga-jaga) ---
         if "BUNGA" in upper and "PAJAK" not in upper:
             bunga_val = num_vals[0] if num_vals else 0.0
             transactions.append({
@@ -139,7 +157,7 @@ def parse_bca(file_bytes, password=None):
             })
             continue
 
-        # BIAYA ADM / TRANSFER / REFERENSI
+        # --- BIAYA ADM / TRANSFER / REFERENSI ---
         if "BIAYA ADM" in upper or "BIAYA TRANSFER" in upper or "BIAYA REFERENSI" in upper:
             biaya_val = num_vals[0] if num_vals else 0.0
             saldo_val = None
@@ -154,7 +172,7 @@ def parse_bca(file_bytes, password=None):
             })
             continue
 
-        # TRANSAKSI NORMAL
+        # --- TRANSAKSI NORMAL ---
         is_db = False
         if re.search(r"\bDB\b", upper): is_db = True
         elif any(k in upper for k in ["EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA"]): is_db = True
