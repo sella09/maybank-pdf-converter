@@ -44,11 +44,13 @@ def to_float(num_str):
 # ==== BERSIHKAN TEKS FOOTER/HEADER BCA ====
 FOOTER_PATTERNS = [
     r"Bersambung ke halaman berikut\.?",
-    r"SALDO AWAL\s*:\s*[\d,.]+\s*MUTASI\s*(CR|DB)?\s*:\s*[\d,.]+\s*MUTASI\s*(CR|DB)?\s*:\s*[\d,.]+\s*SALDO AKHIR\s*:\s*[\d,.]+",
-    r"MUTASI\s*(CR|DB)?\s*:\s*[\d,.]+\s*MUTASI\s*(CR|DB)?\s*:\s*[\d,.]+\s*SALDO AKHIR\s*:\s*[\d,.]+",
-    r"CATATAN\s*:.*?Rekening\.?",
-    r"Apabila nasabah.*?Rekening\.?",
-    r"BCA berhak.*?Rekening\.?",
+    # Footer ringkasan bulanan (angka opsional, tanpa angka juga kena)
+    r"SALDO\s+AWAL\s*:[\s\S]*?(SALDO\s+AKHIR\s*:[\s\S]*)?",
+    r"MUTASI\s*(CR|DB)?\s*:[\s\S]*?(SALDO\s+AKHIR\s*:[\s\S]*)?",
+    r"SALDO\s+AKHIR\s*:[\s\S]*",
+    r"CATATAN\s*:[\s\S]*?Rekening\.?",
+    r"Apabila nasabah[\s\S]*?Rekening\.?",
+    r"BCA berhak[\s\S]*?Rekening\.?",
     r"HALAMAN\s*:\s*\d+\s*/\s*\d+",
     r"PERIODE\s*:\s*[A-Za-z]+\s+\d{4}",
     r"MATA UANG\s*:\s*IDR",
@@ -64,7 +66,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA — pdfplumber, keterangan UTUH, DB/CR DIPERBAIKI
+# PARSER BCA
 # =========================================================
 DB_KEYWORDS = [
     "EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET",
@@ -100,8 +102,9 @@ def parse_bca(file_bytes, password=None):
     pdf = open_pdf(file_obj, password)
 
     tahun = "2026"
-    saldo_awal = 0.0
+    saldo_awal_global = 0.0
     order = 0
+    saldo_awal_seen = False  # sudah ketemu SALDO AWAL pertama?
 
     for page in pdf.pages:
         if page.page_number == 1:
@@ -109,7 +112,7 @@ def parse_bca(file_bytes, password=None):
             m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", text, re.IGNORECASE)
             if m: tahun = m.group(1)
             m_saldo = re.search(r"SALDO\s+AWAL\s*[\n:]?\s*([\d,.]+)", text, re.IGNORECASE)
-            if m_saldo: saldo_awal = to_float(m_saldo.group(1)) or 0.0
+            if m_saldo: saldo_awal_global = to_float(m_saldo.group(1)) or 0.0
 
         words = page.extract_words(keep_blank_chars=True)
         lines = {}
@@ -124,7 +127,6 @@ def parse_bca(file_bytes, password=None):
             row = sorted(lines[y], key=lambda w: w['x0'])
             row_text = " ".join([w['text'] for w in row])
 
-            # Cek dulu apakah ini baris footer (tanpa tanggal)
             m_date = re.match(r"^(\d{2}/\d{2})\s+(.+)", row_text)
             if not m_date:
                 if prev_txn is not None:
@@ -155,22 +157,23 @@ def parse_bca(file_bytes, password=None):
             upper_rest = rest_text.upper()
 
             # === KHUSUS BARIS SALDO AWAL ===
-            if upper_rest.startswith("SALDO AWAL") or "SALDO AWAL" in upper_rest[:20]:
-                desc = "SALDO AWAL"
-                # Baris SALDO AWAL bukan transaksi: Debit 0, Kredit 0, Saldo = nominal
-                saldo_awal = nominal
-                transactions.append({
-                    "Tanggal": f"{tgl}/{tahun}",
-                    "Kode": "-",
-                    "Keterangan": desc,
-                    "Debit": 0.0,
-                    "Kredit": 0.0,
-                    "Saldo": nominal,
-                    "Tipe Asli": "AWAL",
-                    "_order": order,
-                })
-                order += 1
-                prev_txn = transactions[-1]
+            if "SALDO AWAL" in upper_rest[:25]:
+                if not saldo_awal_seen:
+                    # SALDO AWAL pertama = saldo awal sebenarnya
+                    saldo_awal_seen = True
+                    transactions.append({
+                        "Tanggal": f"{tgl}/{tahun}",
+                        "Kode": "-",
+                        "Keterangan": "SALDO AWAL",
+                        "Debit": 0.0,
+                        "Kredit": 0.0,
+                        "Saldo": nominal,
+                        "Tipe Asli": "AWAL",
+                        "_order": order,
+                    })
+                    order += 1
+                    prev_txn = transactions[-1]
+                # SALDO AWAL kedua/berikutnya → skip (bug PDF)
                 continue
 
             is_db = detect_dbcr(upper_rest)
@@ -205,17 +208,35 @@ def parse_bca(file_bytes, password=None):
     # Sort stabil: Tanggal lalu urutan asli PDF
     transactions.sort(key=lambda x: (x["Tanggal"], x["_order"]))
 
-    # Running balance
-    saldo_berjalan = saldo_awal
+    # ==== VALIDASI SALDO SILANG: pastikan Debit/Kredit konsisten ====
+    saldo_berjalan = None
     for txn in transactions:
         if txn["Tipe Asli"] == "AWAL":
             saldo_berjalan = txn["Saldo"]
             continue
+
+        if saldo_berjalan is None:
+            saldo_berjalan = 0.0
+
         if txn["Saldo"] is not None:
-            saldo_berjalan = txn["Saldo"]
+            # Cek: saldo_baru == saldo_lama - Debit + Kredit ?
+            expected = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
+            if abs(expected - txn["Saldo"]) > 1.0:
+                # Coba swap Debit/Kredit
+                expected_swap = round(saldo_berjalan + txn["Debit"] - txn["Kredit"], 2)
+                if abs(expected_swap - txn["Saldo"]) <= 1.0:
+                    # Swap benar → tukar
+                    txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"]
+                    txn["Tipe Asli"] = "DB" if txn["Debit"] > 0 else "CR"
+                    saldo_berjalan = txn["Saldo"]
+                else:
+                    # Tidak bisa dipastikan → pakai saldo PDF
+                    saldo_berjalan = txn["Saldo"]
+            else:
+                saldo_berjalan = txn["Saldo"]
         else:
-            saldo_berjalan = saldo_berjalan - txn["Debit"] + txn["Kredit"]
-            txn["Saldo"] = round(saldo_berjalan, 2)
+            saldo_berjalan = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
+            txn["Saldo"] = saldo_berjalan
 
     return transactions
 
@@ -312,11 +333,9 @@ if uploaded_files:
         final_df = pd.concat(all_dfs, ignore_index=True)
         final_df["Tanggal"] = final_df["Tanggal"].astype(str).str.strip()
         final_df["Tanggal_DT"] = pd.to_datetime(final_df["Tanggal"], format="%d/%m/%Y", errors="coerce")
-        # Sort stabil: Tanggal → urutan asli PDF
         final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
 
-        # Tampilkan semua, termasuk SALDO AWAL
         st.subheader("📊 Preview Data (Keterangan Bersih)")
         st.dataframe(final_df, use_container_width=True)
 
@@ -327,6 +346,6 @@ if uploaded_files:
         st.download_button(
             "📥 Download Excel",
             data=output.getvalue(),
-            file_name="mutasi_bank_clean.xlsx",
+            file_name="mutasi_bank_final.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
