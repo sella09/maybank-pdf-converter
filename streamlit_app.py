@@ -44,16 +44,14 @@ def to_float(num_str):
 def clean_desc(text):
     if not text: return ""
     t = str(text)
+    # Hapus footer
     t = re.sub(r"Bersambung ke halaman berikut\.?", "", t, flags=re.I)
     t = re.sub(r"SALDO\s+AWAL\s*:.*?(SALDO\s+AKHIR\s*:.*)?", "", t, flags=re.I)
     t = re.sub(r"CATATAN\s*:.*?Rekening\.?", "", t, flags=re.I | re.S)
-    t = re.sub(r"HALAMAN\s*:.*?IDR", "", t, flags=re.I)
-    # Buang nomor referensi panjang
-    t = re.sub(r"[A-Z0-9]{10,}", "", t) 
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (MUTLAK MEMBALIK DEBIT/KREDIT)
+# PARSER BCA (TOTAL REWRITE - ANTI TEKS NGACO)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -94,9 +92,9 @@ def parse_bca(file_bytes, password=None):
 
                 tgl = m_date.group(1)
                 rest_text = m_date.group(2)
-                upper_rest = rest_text.upper()
 
-                # Ekstrak angka (Nominal dan Saldo)
+                # EKSTRAK NOMINAL & SALDO
+                # Ambil semua angka desimal di baris ini
                 nums_raw = re.findall(r"\d[\d,]*\.\d{2}", row_text)
                 nums = [to_float(n) for n in nums_raw]
                 
@@ -110,31 +108,26 @@ def parse_bca(file_bytes, password=None):
                     nominal = 0.0
                     saldo = None
 
-                # === LOGIKA PEMBALIKAN MUTLAK ===
-                # Jika di PDF aslinya ini adalah CR / Uang Masuk (BI-FAST, TRSF CR)
-                # Kita PAKSA masuk ke DEBIT (Uang Keluar).
-                # Jika di PDF aslinya ini DB (EDDY SUFENDI), kita PAKSA masuk ke KREDIT.
+                # BERSIHKAN TEKS KETERANGAN
+                # 1. Hapus angka-angka (nominal & saldo) dari teks
+                desc_text = rest_text
+                for n in nums_raw:
+                    desc_text = desc_text.replace(n, "")
                 
-                is_original_db = False
-                if any(k in upper_rest for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA"]):
-                    is_original_db = True
-                elif "TRSF E-BANKING DB" in upper_rest:
-                    is_original_db = True
+                # 2. Hapus kode DB/CR
+                desc_text = re.sub(r"\bDB\b|\bCR\b", "", desc_text, flags=re.I)
+                
+                # 3. Rapikan spasi ganda
+                desc_text = " ".join(desc_text.split())
 
-                # BALIK POSISINYA
-                if is_original_db:
-                    # Aslinya Debit, kita jadikan Kredit
-                    debit_val = 0.0
-                    kredit_val = nominal
-                else:
-                    # Aslinya Kredit, kita jadikan Debit
-                    debit_val = nominal
-                    kredit_val = 0.0
+                # PAKSA MASUK KE DEBIT (Sesuai permintaan terakhir)
+                debit_val = nominal
+                kredit_val = 0.0
 
                 current_txn = {
                     "Tanggal": f"{tgl}/{tahun}",
                     "Kode": "-",
-                    "Keterangan": rest_text,
+                    "Keterangan": desc_text,
                     "Debit": debit_val,
                     "Kredit": kredit_val,
                     "Saldo": saldo,
@@ -144,7 +137,11 @@ def parse_bca(file_bytes, password=None):
 
             else:
                 if current_txn:
-                    current_txn["Keterangan"] += " " + row_text
+                    # Lanjutan teks keterangan
+                    extra_text = row_text
+                    extra_text = re.sub(r"\bDB\b|\bCR\b", "", extra_text, flags=re.I)
+                    extra_text = re.sub(r"\d[\d,]*\.\d{2}", "", extra_text) # buang angka nyasar
+                    current_txn["Keterangan"] += " " + extra_text
 
         if current_txn:
             current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
@@ -161,7 +158,7 @@ def parse_bca(file_bytes, password=None):
     return transactions
 
 # =========================================================
-# PARSER MAYBANK (TIDAK DIUBAH)
+# PARSER MAYBANK
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_maybank(file_bytes, password=None):
@@ -256,7 +253,7 @@ if uploaded_files:
         final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
 
-        st.subheader("📊 Preview Data (Debit & Kredit Dibalik Total)")
+        st.subheader("📊 Preview Data (Keterangan Rapi & Debit Terisi)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
