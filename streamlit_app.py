@@ -34,7 +34,6 @@ def to_float(num_str):
     if not s or s in ("-", ""): return 0.0
     s = re.sub(r"[^\d.,]", "", s)
     if not s: return 0.0
-    # Bersihkan format Indonesia (1.000.000,00)
     if re.search(r",\d{2}$", s) and "." in s:
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -52,7 +51,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (TABEL GRID MUTLAK)
+# PARSER BCA (TEKS UTUH LAYOUT)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -63,94 +62,122 @@ def parse_bca(file_bytes, password=None):
     order = 0
 
     for page in pdf.pages:
-        # Ambil Tahun
         if page.page_number == 1:
             text = page.extract_text() or ""
             m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", text, re.IGNORECASE)
             if m: tahun = m.group(1)
 
-        # EKSTRAK TABEL BERDASARKAN GARIS (LINES)
-        tables = page.extract_tables({
-            "vertical_strategy": "lines", 
-            "horizontal_strategy": "lines"
-        })
-        
-        # Jika tidak ada garis, fallback ke spasi (text)
-        if not tables:
-            tables = page.extract_tables({
-                "vertical_strategy": "text", 
-                "horizontal_strategy": "text"
-            })
+        # Mengambil teks dengan layout asli (spasi terjaga)
+        layout_text = page.extract_text(layout=True)
+        if not layout_text: continue
 
-        for table in tables:
-            for row in table:
-                if not row or len(row) < 4: continue
-                
-                # Cari tanggal di dalam baris
-                tgl_match = None
-                for cell in row:
-                    if cell and re.match(r"^\d{2}/\d{2}$", str(cell).strip()):
-                        tgl_match = str(cell).strip()
-                        break
-                
-                if not tgl_match: continue
+        lines = layout_text.split("\n")
+        current_txn = None
 
-                # Gabungkan semua teks di baris untuk mencari angka
-                full_text = " ".join([str(c) for c in row if c])
-                upper_text = full_text.upper()
+        for line in lines:
+            line_str = line.strip()
+            if not line_str: continue
+            if any(k in line_str.upper() for k in ["REKENING GIRO", "KCIU RAWAMANGUN", "NO. REKENING", "PERIODE :", "MATA UANG", "CATATAN:", "BCA BERHAK"]):
+                continue
 
-                # Ambil semua angka nominal
-                nums = re.findall(r"\d[\d,]*\.\d{2}", full_text)
-                parsed_nums = [to_float(n) for n in nums]
+            # Cek apakah baris ini memulai transaksi baru (diawali DD/MM)
+            m_date = re.match(r"^(\d{2}/\d{2})\s+(.+)", line_str)
+            
+            if m_date:
+                if current_txn:
+                    current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
+                    transactions.append(current_txn)
 
-                if len(parsed_nums) == 0: 
-                    continue
-                elif len(parsed_nums) == 1:
-                    nominal = parsed_nums[0]
-                    saldo = None
-                else:
-                    nominal = parsed_nums[0]
-                    saldo = parsed_nums[-1]
+                tgl = m_date.group(1)
+                rest_text = m_date.group(2)
 
-                # Deteksi DB/CR Mutlak
-                is_db = False
-                if any(k in upper_text for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA", "SWITCHING KE", "TRSF E-BANKING DB"]):
-                    is_db = True
-                
-                debit_val = nominal if is_db else 0.0
-                kredit_val = nominal if not is_db else 0.0
+                # Ekstrak angka murni (format 1.000.000.00 atau 1000.00)
+                nums_raw = re.findall(r"\b\d{1,3}(?:,\d{3})*\.\d{2}\b|\b\d+\.\d{2}\b", rest_text)
+                nums = [to_float(n) for n in nums_raw]
 
-                # Bersihkan Teks Keterangan
-                desc_text = full_text.replace(tgl_match, "")
-                for n in nums:
+                # Hapus angka dari teks untuk dijadikan keterangan
+                desc_text = rest_text
+                for n in nums_raw:
                     desc_text = desc_text.replace(n, "")
-                desc_text = re.sub(r"\bDB\b|\bCR\b", "", desc_text, flags=re.I)
-                desc_text = clean_desc(desc_text)
+                
+                upper_desc = desc_text.upper()
 
-                transactions.append({
-                    "Tanggal": f"{tgl_match}/{tahun}",
+                # Deteksi DB/CR
+                is_db = False
+                if any(k in upper_desc for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA"]):
+                    is_db = True
+                elif "TRSF E-BANKING DB" in upper_desc:
+                    is_db = True
+
+                current_txn = {
+                    "Tanggal": f"{tgl}/{tahun}",
                     "Kode": "-",
                     "Keterangan": desc_text,
-                    "Debit": debit_val,
-                    "Kredit": kredit_val,
-                    "Saldo": saldo,
+                    "Debit": 0.0,
+                    "Kredit": 0.0,
+                    "Saldo": None,
+                    "Nums": nums, # Simpan dulu angkanya
                     "_order": order,
-                })
+                }
                 order += 1
+
+            else:
+                # Ini baris lanjutan
+                if current_txn:
+                    current_txn["Keterangan"] += " " + line_str
+                    
+                    # Cek jika di baris lanjutan ini ternyata ada angka (misal 7194000.00)
+                    nums_raw = re.findall(r"\b\d{1,3}(?:,\d{3})*\.\d{2}\b|\b\d+\.\d{2}\b", line_str)
+                    if nums_raw:
+                        for n in nums_raw:
+                            current_txn["Nums"].append(to_float(n))
+                            current_txn["Keterangan"] = current_txn["Keterangan"].replace(n, "")
+
+        if current_txn:
+            current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
+            transactions.append(current_txn)
+            current_txn = None
 
     pdf.close()
 
-    # Validasi Silang Saldo (Paksa Bener)
-    saldo_berjalan = 0.0
+    # PROSES AKHIR: TENTUKAN NOMINAL, SALDO, DAN DEBIT/KREDIT
     for txn in transactions:
-        if txn["Saldo"] is not None:
-            if saldo_berjalan != 0.0:
-                expected = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
-                if abs(expected - txn["Saldo"]) > 1.0:
-                    expected_swap = round(saldo_berjalan + txn["Debit"] - txn["Kredit"], 2)
-                    if abs(expected_swap - txn["Saldo"]) <= 1.0:
-                        txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"]
-            saldo_berjalan = txn["Saldo"]
+        nums = txn["Nums"]
+        del txn["Nums"] # Hapus dari output akhir
+
+        upper_text = txn["Keterangan"].upper()
+
+        # Aturan Utama BCA
+        is_db = False
+        if any(k in upper_text for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA", "SWITCHING KE", "SWITCHING TRANSFER KE", "TRSF E-BANKING DB"]):
+            is_db = True
+            
+        # Tentukan Nominal dan Saldo
+        # Asumsi: Angka pertama = Nominal, Angka terakhir = Saldo
+        if len(nums) >= 2:
+            nominal = nums[0]
+            saldo = nums[-1]
+        elif len(nums) == 1:
+            nominal = nums[0]
+            saldo = None
+        else:
+            nominal = 0.0
+            saldo = None
+
+        debit_val = nominal if is_db else 0.0
+        kredit_val = nominal if not is_db else 0.0
+
+        if "BUNGA" in upper_text and "PAJAK" not in upper_text:
+            debit_val, kredit_val = 0.0, nominal
+
+        txn["Debit"] = debit_val
+        txn["Kredit"] = kredit_val
+        txn["Saldo"] = saldo
+
+        # Bersihkan sisa teks
+        txn["Keterangan"] = re.sub(r"\bDB\b|\bCR\b", "", txn["Keterangan"]).strip()
+        txn["Keterangan"] = re.sub(r"\b\d{4}/[A-Z0-9/]+\b", "", txn["Keterangan"]).strip()
+        txn["Keterangan"] = " ".join(txn["Keterangan"].split())
 
         if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
         elif txn["Kredit"] > 0: txn["Tipe Asli"] = "CR"
@@ -254,7 +281,7 @@ if uploaded_files:
         final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
 
-        st.subheader("📊 Preview Data (Bersih & Akurat)")
+        st.subheader("📊 Preview Data (Bersih Total)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
