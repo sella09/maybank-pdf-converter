@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Final Fixed)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -68,14 +68,27 @@ def parse_bca_perfect(file_obj, password=None):
         nominal = 0.0
         is_db = False
 
-        if "PAJAK BUNGA" in combined_text.upper() or "BIAYA ADM" in combined_text.upper():
+        # Penanganan khusus untuk baris BUNGA, PAJAK BUNGA, dan BIAYA ADM
+        upper_text = combined_text.upper()
+        if "PAJAK BUNGA" in upper_text or "BIAYA ADM" in upper_text:
             db_match = re.search(r"([\d,]+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
             if db_match:
                 nominal = float(db_match.group(1).replace(',', ''))
                 is_db = True
             saldo_str = matches[-1].group(1).replace(',', '')
             saldo = float(saldo_str)
+        elif "BUNGA" in upper_text:
+            # Bunga bank biasanya merupakan penambahan (CR) tanpa teks DB
+            bunga_match = re.search(r"([\d,]+\.\d{2})", combined_text)
+            if bunga_match:
+                nominal = float(bunga_match.group(1).replace(',', ''))
+            is_db = False
+            # Jika ada saldo di ujung baris
+            if len(matches) >= 2:
+                saldo_str = matches[-1].group(1).replace(',', '')
+                saldo = float(saldo_str)
         else:
+            # Transaksi normal (Transfer / Terima Dana)
             if len(matches) >= 2:
                 saldo_str = matches[-1].group(1).replace(',', '')
                 saldo = float(saldo_str)
@@ -198,7 +211,7 @@ if uploaded_files:
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
         
-        # PERBAIKAN URUTAN BULAN (KRONOLOGIS):
+        # Pengurutan Kronologis dari Bulan Terkecil (Januari) ke Terbesar
         try:
             final_df['Tanggal'] = final_df['Tanggal'].astype(str).str.strip()
             final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
