@@ -48,7 +48,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (HITUNG MATEMATIS DARI SALDO AWAL)
+# PARSER BCA (DETEKSI CERDAS & SALDO PRESISI)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -72,7 +72,7 @@ def parse_bca(file_bytes, password=None):
     if m_saldo: 
         saldo_awal = to_float(m_saldo.group(1)) or 0.0
 
-    # 2. Pembersihan Teks Sampah (Header, Footer, Halaman)
+    # 2. Pembersihan Teks
     full_text = re.sub(r"KELAPA GADING HALAMAN : \d+ /\d+ KELAPA GADING BARAT JL BOULEVARD RAYA QF 1 NO 7 INDONESIA TANGGAL KETERANGAN CBG MUTASI SALDO", "", full_text, flags=re.IGNORECASE)
     full_text = re.sub(r"KELAPA GADING HALAMAN : \d+ / \d+ KELAPA GADING BARAT JL BOULEVARD RAYA QF 1 NO 7 INDONESIA TANGGAL KETERANGAN CBG MUTASI SALDO", "", full_text, flags=re.IGNORECASE)
     full_text = re.sub(r"Bersambung ke halaman berikut", "", full_text, flags=re.IGNORECASE)
@@ -95,14 +95,6 @@ def parse_bca(file_bytes, password=None):
             merged_lines[-1] += " " + s
 
     # 4. Parsing Transaksi
-    db_keywords = [
-        "EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA", 
-        "TIGA MUSTIKA KONSU", "PT.FINNET", "PT. FINNET", "BA JASA E-BANKING",
-        "BIAYA ADM", "BIAYA TRANSFER", "BIAYA REFERENSI", "SWITCHING KE",
-        "SWITCHING TRANSFER KE", "BI-FAST BIF TRANSFER KE", "BI-FAST BIF BIAYA TXN KE",
-        "OTOMATIS", "FEE TELEX", "FEE FULL AMT", "FEE VALUE TDY", "PAJAK BUNGA"
-    ]
-
     for line in merged_lines:
         m_date = re.match(r"^(\d{2}/\d{2})(.*)", line)
         if not m_date: continue
@@ -119,19 +111,32 @@ def parse_bca(file_bytes, password=None):
         if nominal is None: continue
 
         upper_rest = rest.upper()
+        
+        # DETEKSI DB / CR YANG JAUH LEBIH CERDAS
         is_db = False
         
+        # 1. Cek keyword eksplisit UANG KELUAR
+        db_keywords = [
+            "EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA", 
+            "TIGA MUSTIKA KONSU", "PT.FINNET", "PT. FINNET", "BA JASA E-BANKING",
+            "BIAYA ADM", "BIAYA TRANSFER", "BIAYA REFERENSI", "PAJAK BUNGA",
+            "PEMBELIAN", "BY PASANG", "BAYAR", "TRSF E-BANKING DB", "SWITCHING DB"
+        ]
+        
+        # 2. Cek keyword eksplisit UANG MASUK
+        cr_keywords = [
+            "SETORAN TUNAI", "BI-FAST CR", "TRSF E-BANKING CR", "SWITCHING CR", 
+            "KR OTOMATIS", "BUNGA", "REFUND"
+        ]
+
         if any(k in upper_rest for k in db_keywords):
             is_db = True
+        elif any(k in upper_rest for k in cr_keywords):
+            is_db = False
         elif "DB" in upper_rest:
             is_db = True
         elif "CR" in upper_rest:
             is_db = False
-        else:
-            is_db = False
-
-        if "PAJAK BUNGA" in upper_rest or "BIAYA ADM" in upper_rest or "BIAYA REFERENSI" in upper_rest:
-            is_db = True
 
         desc = rest
         for n in nums:
@@ -139,11 +144,8 @@ def parse_bca(file_bytes, password=None):
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
         desc = clean_desc(desc)
 
+        # Mapping: DB -> Kredit, CR -> Debit
         debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
-        
-        if "BUNGA" in upper_rest and not "PAJAK" in upper_rest:
-            debit_val, kredit_val = nominal, 0.0
-            is_db = False
 
         transactions.append({
             "Tanggal": f"{tgl}/{tahun}", 
@@ -151,16 +153,16 @@ def parse_bca(file_bytes, password=None):
             "Keterangan": desc,
             "Debit": debit_val, 
             "Kredit": kredit_val,
-            "Saldo": None, # Selalu None, akan dihitung
+            "Saldo": None, # Akan dihitung running balance
             "Tipe Asli": "DB" if is_db else "CR",
         })
 
-    # 5. HITUNG RUNNING BALANCE MURNI MATEMATIS (ANTI-GAGAL)
+    # 5. HITUNG RUNNING BALANCE
     transactions.sort(key=lambda x: x["Tanggal"])
     
     saldo_berjalan = saldo_awal
     for txn in transactions:
-        # Rumus: Saldo = Saldo Sebelumnya + Uang Masuk (Debit) - Uang Keluar (Kredit)
+        # Rumus: Saldo + Debit (Uang Masuk) - Kredit (Uang Keluar)
         saldo_berjalan = saldo_berjalan + txn["Debit"] - txn["Kredit"]
         txn["Saldo"] = round(saldo_berjalan, 2)
 
@@ -259,7 +261,7 @@ if uploaded_files:
         final_df = final_df.drop(columns=["Tanggal_DT"])
         final_df = final_df[(final_df["Debit"] > 0) | (final_df["Kredit"] > 0)]
 
-        st.subheader("📊 Preview Data (Saldo Presisi Matematis)")
+        st.subheader("📊 Preview Data (Saldo Running Balance)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
