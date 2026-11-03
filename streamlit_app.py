@@ -48,7 +48,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (SALDO PRESISI + VALIDASI)
+# PARSER BCA (HITUNG MATEMATIS DARI SALDO AWAL)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -72,7 +72,7 @@ def parse_bca(file_bytes, password=None):
     if m_saldo: 
         saldo_awal = to_float(m_saldo.group(1)) or 0.0
 
-    # 2. Pembersihan Teks Sampah
+    # 2. Pembersihan Teks Sampah (Header, Footer, Halaman)
     full_text = re.sub(r"KELAPA GADING HALAMAN : \d+ /\d+ KELAPA GADING BARAT JL BOULEVARD RAYA QF 1 NO 7 INDONESIA TANGGAL KETERANGAN CBG MUTASI SALDO", "", full_text, flags=re.IGNORECASE)
     full_text = re.sub(r"KELAPA GADING HALAMAN : \d+ / \d+ KELAPA GADING BARAT JL BOULEVARD RAYA QF 1 NO 7 INDONESIA TANGGAL KETERANGAN CBG MUTASI SALDO", "", full_text, flags=re.IGNORECASE)
     full_text = re.sub(r"Bersambung ke halaman berikut", "", full_text, flags=re.IGNORECASE)
@@ -117,11 +117,6 @@ def parse_bca(file_bytes, password=None):
         
         nominal = to_float(nums[0])
         if nominal is None: continue
-        
-        # Ambil saldo terakhir, tapi validasi jika terlalu wajar
-        saldo = to_float(nums[-1]) if len(nums) > 1 else None
-        if saldo is not None and (saldo < 0 or saldo > 9999999999):
-            saldo = None # Abaikan saldo yang tidak wajar, biarkan sistem menghitung
 
         upper_rest = rest.upper()
         is_db = False
@@ -138,13 +133,9 @@ def parse_bca(file_bytes, password=None):
         if "PAJAK BUNGA" in upper_rest or "BIAYA ADM" in upper_rest or "BIAYA REFERENSI" in upper_rest:
             is_db = True
 
-        # Bersihkan Keterangan (Hanya buang kode referensi)
         desc = rest
         for n in nums:
             desc = desc.replace(n, "")
-        
-        # Buang teks yang mengandung / (seperti 0501/FTSCY/WS95031) tapi pertahankan nama
-        desc = re.sub(r"\b\w+/\w+\b", "", desc, flags=re.I)
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
         desc = clean_desc(desc)
 
@@ -160,20 +151,18 @@ def parse_bca(file_bytes, password=None):
             "Keterangan": desc,
             "Debit": debit_val, 
             "Kredit": kredit_val,
-            "Saldo": saldo, 
+            "Saldo": None, # Selalu None, akan dihitung
             "Tipe Asli": "DB" if is_db else "CR",
         })
 
-    # 5. Hitung Running Balance
+    # 5. HITUNG RUNNING BALANCE MURNI MATEMATIS (ANTI-GAGAL)
     transactions.sort(key=lambda x: x["Tanggal"])
     
     saldo_berjalan = saldo_awal
     for txn in transactions:
-        if txn["Saldo"] is not None:
-            saldo_berjalan = txn["Saldo"]
-        else:
-            saldo_berjalan = saldo_berjalan + txn["Debit"] - txn["Kredit"]
-            txn["Saldo"] = round(saldo_berjalan, 2)
+        # Rumus: Saldo = Saldo Sebelumnya + Uang Masuk (Debit) - Uang Keluar (Kredit)
+        saldo_berjalan = saldo_berjalan + txn["Debit"] - txn["Kredit"]
+        txn["Saldo"] = round(saldo_berjalan, 2)
 
     return transactions
 
@@ -270,7 +259,7 @@ if uploaded_files:
         final_df = final_df.drop(columns=["Tanggal_DT"])
         final_df = final_df[(final_df["Debit"] > 0) | (final_df["Kredit"] > 0)]
 
-        st.subheader("📊 Preview Data (Saldo Presisi)")
+        st.subheader("📊 Preview Data (Saldo Presisi Matematis)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
