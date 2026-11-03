@@ -48,7 +48,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (REGEX BERDASARKAN POLA TEKS)
+# PARSER BCA (DENGAN RUNNING BALANCE MATEMATIS)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -62,11 +62,17 @@ def parse_bca(file_bytes, password=None):
         if t: full_text += t + "\n"
     pdf.close()
 
+    # 1. Ambil Tahun dan Saldo Awal dari PDF
     tahun = "2026"
     m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", full_text, re.IGNORECASE)
     if m: tahun = m.group(1)
 
-    # 1. Parse Baris
+    saldo_awal = 0.0
+    m_saldo = re.search(r"SALDO\s+AWAL\s*[\n:]?\s*([\d,.]+)", full_text, re.IGNORECASE)
+    if m_saldo: 
+        saldo_awal = to_float(m_saldo.group(1)) or 0.0
+
+    # 2. Bersihkan baris
     lines = full_text.split('\n')
     ignore_keywords = [
         "REKENING GIRO", "KCU", "DOMINIC DIGITAL", "KELAPA GADING", "JL BOULEVARD",
@@ -85,7 +91,7 @@ def parse_bca(file_bytes, password=None):
         if any(kw.lower() in s.lower() for kw in ignore_keywords): continue
         clean_lines.append(s)
 
-    # Gabungkan baris yang terpotong (jika tidak diawali tanggal)
+    # 3. Gabungkan baris yang terpotong (jika tidak diawali tanggal)
     merged_lines = []
     for s in clean_lines:
         if re.match(r"^\d{2}/\d{2}", s):
@@ -93,7 +99,7 @@ def parse_bca(file_bytes, password=None):
         elif merged_lines:
             merged_lines[-1] += " " + s
 
-    # 2. Ekstrak Data
+    # 4. Ekstrak Transaksi
     db_keywords = [
         "EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA",
         "TIGA MUSTIKA KONSU", "PT.FINNET", "PT. FINNET", "BA JASA E-BANKING",
@@ -110,16 +116,14 @@ def parse_bca(file_bytes, password=None):
         tgl = m_date.group(1)
         rest = m_date.group(2).strip()
         
-        # Cari semua format angka desimal (titik 2 digit di belakang)
+        # Cari semua format angka desimal
         nums = re.findall(r"\d[\d,]*\.\d{2}", rest)
         if not nums: continue
 
-        num_vals = [to_float(n) for n in nums if to_float(n) is not None]
-        
-        # LOGIKA UTAMA BCA: 
-        # Di BCA, angka pertama adalah Mutasi, angka terakhir adalah Saldo Akhir.
-        nominal = num_vals[0]
-        saldo = num_vals[-1] if len(num_vals) >= 2 else None
+        # LOGIKA BCA: Angka pertama adalah nominal mutasi
+        # Kita abaikan angka terakhir (karena saldo dari PDF sering berantakan)
+        nominal = to_float(nums[0])
+        if nominal is None: continue
         
         # Tentukan arah DB / CR
         upper = rest.upper()
@@ -129,7 +133,7 @@ def parse_bca(file_bytes, password=None):
         elif any(k in upper for k in db_keywords):
             is_db = True
 
-        # Bersihkan deskripsi dari angka dan kata DB/CR
+        # Bersihkan deskripsi
         desc = rest
         for n in nums:
             desc = desc.replace(n, "")
@@ -145,9 +149,22 @@ def parse_bca(file_bytes, password=None):
             "Keterangan": desc,
             "Debit": debit_val, 
             "Kredit": kredit_val,
-            "Saldo": saldo, 
+            "Saldo": None, # Akan dihitung nanti
             "Tipe Asli": "DB" if is_db else "CR",
         })
+
+    # 5. HITUNG RUNNING BALANCE MATEMATIS (ANTI-GAGAL)
+    # Urutkan berdasarkan tanggal + urutan asli
+    for i, txn in enumerate(transactions):
+        txn["_order"] = i
+    transactions.sort(key=lambda x: (x["Tanggal"], x["_order"]))
+
+    saldo_berjalan = saldo_awal
+    for txn in transactions:
+        # Rumus: Saldo = Saldo Awal + Uang Masuk (Debit) - Uang Keluar (Kredit)
+        saldo_berjalan = saldo_berjalan + txn["Debit"] - txn["Kredit"]
+        txn["Saldo"] = round(saldo_berjalan, 2)
+        del txn["_order"]
 
     return transactions
 
@@ -244,7 +261,7 @@ if uploaded_files:
         final_df = final_df.drop(columns=["Tanggal_DT"])
         final_df = final_df[(final_df["Debit"] > 0) | (final_df["Kredit"] > 0)]
 
-        st.subheader("📊 Preview Data (Saldo Persis PDF)")
+        st.subheader("📊 Preview Data (Saldo Presisi Matematis)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
