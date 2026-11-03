@@ -48,7 +48,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (BERDASARKAN KOORDINAT ANGKA)
+# PARSER BCA (KETERANGAN UTUH & SALDO PRESISI)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -60,7 +60,6 @@ def parse_bca(file_bytes, password=None):
     saldo_awal = 0.0
 
     for page in pdf.pages:
-        # 1. Ambil Tahun & Saldo Awal
         if page.page_number == 1:
             text = page.extract_text() or ""
             m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", text, re.IGNORECASE)
@@ -68,10 +67,7 @@ def parse_bca(file_bytes, password=None):
             m_saldo = re.search(r"SALDO\s+AWAL\s*[\n:]?\s*([\d,.]+)", text, re.IGNORECASE)
             if m_saldo: saldo_awal = to_float(m_saldo.group(1)) or 0.0
 
-        # 2. Ekstrak semua kata & posisi (X, Y)
         words = page.extract_words(keep_blank_chars=True)
-        
-        # 3. Kelompokkan per baris (Y-coordinate)
         lines = {}
         for w in words:
             y = round(w['top'], 1)
@@ -82,37 +78,27 @@ def parse_bca(file_bytes, password=None):
             row = sorted(lines[y], key=lambda w: w['x0'])
             row_text = " ".join([w['text'] for w in row])
             
-            # Deteksi Tanggal di awal
             m_date = re.match(r"^(\d{2}/\d{2})\s+(.+)", row_text)
             if not m_date: continue
             
             tgl = m_date.group(1)
             rest_text = m_date.group(2)
 
-            # 4. Ambil semua angka beserta posisi X-nya
+            # Ambil angka & posisinya
             nums = []
             for w in row:
-                # Hanya kata yang berbentuk angka desimal
                 if re.match(r"^\d[\d,]*\.\d{2}$", w['text']):
-                    nums.append({
-                        "val": to_float(w['text']),
-                        "x": w['x0']
-                    })
+                    nums.append({"val": to_float(w['text']), "x": w['x0']})
             
             if len(nums) < 2: continue
             
-            # 5. Urutkan angka dari KIRI ke KANAN
             nums = sorted(nums, key=lambda n: n['x'])
-            
-            # Di BCA: Angka paling kiri = Mutasi, Angka paling kanan = Saldo
             nominal = nums[0]['val']
             saldo = nums[-1]['val']
             
-            # Validasi: Jika angka kanan sama dengan kiri, berarti saldo gagal diambil
             if saldo == nominal:
                 saldo = None
 
-            # 6. Deteksi DB / CR
             upper_rest = rest_text.upper()
             is_db = False
             if any(k in upper_rest for k in ["EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA",
@@ -127,10 +113,13 @@ def parse_bca(file_bytes, password=None):
             elif "CR" in upper_rest:
                 is_db = False
 
+            # === PERBAIKAN KETERANGAN ===
             desc = rest_text
-            for w in row:
-                if re.match(r"^\d[\d,]*\.\d{2}$", w['text']):
-                    desc = desc.replace(w['text'], "")
+            # Buang kode referensi (format: 0501/FTSCY/WS95051)
+            desc = re.sub(r"\b\w+/\w+(?:/\w+)*\b", "", desc)
+            # Buang angka desimal
+            desc = re.sub(r"\d[\d,]*\.\d{2}", "", desc)
+            # Buang kata DB / CR
             desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
             desc = clean_desc(desc)
 
@@ -152,7 +141,6 @@ def parse_bca(file_bytes, password=None):
 
     pdf.close()
 
-    # 7. Hitung Running Balance untuk baris yang saldonya kosong
     transactions.sort(key=lambda x: x["Tanggal"])
     saldo_berjalan = saldo_awal
     for txn in transactions:
@@ -257,7 +245,7 @@ if uploaded_files:
         final_df = final_df.drop(columns=["Tanggal_DT"])
         final_df = final_df[(final_df["Debit"] > 0) | (final_df["Kredit"] > 0)]
 
-        st.subheader("📊 Preview Data (Saldo Running Balance)")
+        st.subheader("📊 Preview Data (Keterangan Utuh)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
