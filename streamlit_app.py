@@ -30,7 +30,6 @@ def to_float(num_str):
     if not s or s in ("-", ""): return None
     s = re.sub(r"[^\d.,]", "", s)
     if not s: return None
-    # Format Indonesia 1.234,56 vs English 1,234.56
     if re.search(r",\d{2}$", s) and "." in s:
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -83,31 +82,32 @@ def parse_bca_hybrid(file_obj, password=None):
                 row_text = re.sub(r"^\d{2}/\d{2}\s*", "", joined)
                 upper = row_text.upper()
                 
-                # Skip saldo awal secara eksplisit
                 if "SALDO AWAL" in upper:
                     continue
 
                 is_db = bool(re.search(r"\bDB\b", upper))
                 is_cr = bool(re.search(r"\bCR\b", upper))
                 
-                if "PAJAK BUNGA" in upper or "BIAYA ADM" in upper:
+                # --- LOGIKA KHUSUS BUNGA / PAJAK BUNGA / BIAYA ADM ---
+                if "PAJAK BUNGA" in upper:
                     is_db, is_cr = True, False
                 elif "BUNGA" in upper and "PAJAK" not in upper:
                     is_db, is_cr = False, True
+                elif "BIAYA ADM" in upper or "BIAYA TRANSFER" in upper or "BIAYA REFERENSI" in upper:
+                    is_db, is_cr = True, False
+                elif "EDDY SUFENDI" in upper or "TRANSFER VIA LLG" in upper or "AUTODEBET" in upper:
+                    is_db = True
 
                 decimals = re.findall(r"\d[\d,]*\.\d{2}", row_text)
                 if not decimals: continue
 
+                # AMBIL ANGKA PERTAMA sebagai nominal (bukan yang terakhir)
                 nominal = to_float(decimals[0]) or 0.0
                 saldo = None
                 
-                # LOGIKA SALDO: Ambil angka terakhir, tapi pastikan itu bukan angka nominal
-                # dan formatnya benar (harus ada titik desimal / ribuan)
+                # Saldo: ambil angka terakhir HANYA jika berbeda dari nominal & > 100
                 if len(decimals) >= 2:
-                    saldo_str = decimals[-1]
-                    saldo_val = to_float(saldo_str)
-                    # Filter: saldo harus > 100 (hindari angka kurs USD seperti 6.12)
-                    # dan tidak sama dengan nominal
+                    saldo_val = to_float(decimals[-1])
                     if saldo_val is not None and saldo_val > 100 and saldo_val != nominal:
                         saldo = saldo_val
 
@@ -155,7 +155,7 @@ def parse_bca_hybrid(file_obj, password=None):
                 current_block = {"tgl": m_date.group(1), "lines": [m_date.group(2)]}
             elif current_block:
                 upper_line = line_str.upper()
-                if "BUNGA" in upper_line or "PAJAK BUNGA" in upper_line:
+                if "BUNGA" in upper_line or "PAJAK BUNGA" in upper_line or "BIAYA ADM" in upper_line:
                     raw_blocks.append(current_block)
                     current_block = {"tgl": current_block["tgl"], "lines": [line_str]}
                 else:
@@ -168,43 +168,31 @@ def parse_bca_hybrid(file_obj, password=None):
             if "SALDO AWAL" in combined_text.upper(): continue
 
             upper_text = combined_text.upper()
-            has_db = bool(re.search(r"\bDB\b", upper_text))
-            has_cr = bool(re.search(r"\bCR\b", upper_text))
+            
+            # --- LOGIKA KHUSUS BUNGA / PAJAK BUNGA / BIAYA ADM ---
+            is_db = False
+            if "PAJAK BUNGA" in upper_text:
+                is_db = True
+            elif "BUNGA" in upper_text and "PAJAK" not in upper_text:
+                is_db = False
+            elif "BIAYA ADM" in upper_text or "BIAYA TRANSFER" in upper_text or "BIAYA REFERENSI" in upper_text:
+                is_db = True
+            elif "EDDY SUFENDI" in upper_text or "TRANSFER VIA LLG" in upper_text or "AUTODEBET" in upper_text:
+                is_db = True
+            elif re.search(r"\bDB\b", upper_text):
+                is_db = True
 
             all_decimals = re.findall(r"[\d,]+\.\d{2}", combined_text)
             if not all_decimals: continue
 
-            nominal = 0.0
+            # AMBIL ANGKA PERTAMA sebagai nominal
+            nominal = to_float(all_decimals[0]) or 0.0
             saldo = None
-            is_db = False
-
-            if "PAJAK BUNGA" in upper_text or "BIAYA ADM" in upper_text:
-                is_db = True
-                db_match = re.search(r"([\d,]+\.\d{2})\s*DB", combined_text, flags=re.IGNORECASE)
-                if db_match: nominal = to_float(db_match.group(1)) or 0.0
-                else: nominal = to_float(all_decimals[0]) or 0.0
-                if len(all_decimals) >= 2:
-                    saldo_val = to_float(all_decimals[-1])
-                    if saldo_val is not None and saldo_val > 100 and saldo_val != nominal: saldo = saldo_val
-            elif "BUNGA" in upper_text and "PAJAK" not in upper_text:
-                is_db = False
-                nominal = to_float(all_decimals[0]) or 0.0
-                if len(all_decimals) >= 2:
-                    saldo_val = to_float(all_decimals[-1])
-                    if saldo_val is not None and saldo_val > 100 and saldo_val != nominal: saldo = saldo_val
-            else:
-                if len(all_decimals) >= 2:
-                    nominal = to_float(all_decimals[0]) or 0.0
-                    saldo_val = to_float(all_decimals[-1])
-                    if saldo_val is not None and saldo_val > 100 and saldo_val != nominal: saldo = saldo_val
-                elif len(all_decimals) == 1:
-                    nominal = to_float(all_decimals[0]) or 0.0
-                
-                if has_db: is_db = True
-                elif has_cr: is_db = False
-                else:
-                    db_keywords = ["EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA", "BIAYA TRANSFER SME", "BIAYA REFERENSI", "FEE TELEX", "FEE FULL", "FEE VALUE", "TRANSFER OR VIA IB"]
-                    if any(k in upper_text for k in db_keywords): is_db = True
+            
+            if len(all_decimals) >= 2:
+                saldo_val = to_float(all_decimals[-1])
+                if saldo_val is not None and saldo_val > 100 and saldo_val != nominal:
+                    saldo = saldo_val
 
             desc = combined_text
             for num_str in all_decimals: desc = desc.replace(num_str, "")
@@ -270,9 +258,8 @@ def build_df(transactions, sumber_file):
         "Saldo": t["Saldo"], "Tipe Asli Bank": t["Tipe Asli"]
     } for t in transactions])
     
-    # Forward fill saldo HANYA jika saldo kosong
-    if not df.empty:
-        df["Saldo"] = df["Saldo"].ffill()
+    # HAPUS forward fill. Biarkan saldo kosong jika memang tidak ada di PDF.
+    # Ini menjaga akurasi: saldo hanya ada di baris yang memang mencantumkannya.
     
     return df
 
