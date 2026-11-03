@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Complete Tax Fix)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Final Fix)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -60,7 +60,16 @@ def parse_bca_perfect(file_obj, password=None):
                 "lines": [m_date.group(2)]
             }
         elif current_block:
-            current_block["lines"].append(line_str)
+            # Tangkap khusus baris lanjutan seperti BUNGA atau PAJAK BUNGA di akhir bulan
+            upper_line = line_str.upper()
+            if "BUNGA" in upper_line or "PAJAK BUNGA" in upper_line:
+                raw_blocks.append(current_block)
+                current_block = {
+                    "tgl": current_block["tgl"], # Gunakan tanggal transaksi sebelumnya (akhir bulan)
+                    "lines": [line_str]
+                }
+            else:
+                current_block["lines"].append(line_str)
 
     if current_block:
         raw_blocks.append(current_block)
@@ -79,12 +88,11 @@ def parse_bca_perfect(file_obj, password=None):
         nominal = 0.0
         saldo = None
 
-        # 1. BARIS PAJAK BUNGA & BIAYA ADM (Selalu DB / Pengeluaran)
+        # 1. BARIS PAJAK BUNGA & BIAYA ADM (Selalu DB)
         if "PAJAK BUNGA" in upper_text or "BIAYA ADM" in upper_text:
             is_db = True
-            # Cari angka desimal yang berdampingan dengan DB atau angka pertama
-            db_match = re.search(r"([\d,]+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
             all_nums = re.findall(r"([\d,]+\.\d{2})", combined_text)
+            db_match = re.search(r"([\d,]+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
             
             if db_match:
                 nominal = float(db_match.group(1).replace(',', ''))
@@ -93,8 +101,10 @@ def parse_bca_perfect(file_obj, password=None):
             
             if len(all_nums) >= 2:
                 saldo = float(all_nums[-1].replace(',', ''))
+            else:
+                saldo = None
         
-        # 2. BARIS BUNGA (Selalu CR / Pemasukan)
+        # 2. BARIS BUNGA (Selalu CR)
         elif "BUNGA" in upper_text and "PAJAK" not in upper_text:
             is_db = False
             all_nums = re.findall(r"([\d,]+\.\d{2})", combined_text)
@@ -102,6 +112,8 @@ def parse_bca_perfect(file_obj, password=None):
                 nominal = float(all_nums[0].replace(',', ''))
             if len(all_nums) >= 2:
                 saldo = float(all_nums[-1].replace(',', ''))
+            else:
+                saldo = None
 
         # 3. TRANSAKSI NORMAL BCA
         else:
@@ -110,11 +122,14 @@ def parse_bca_perfect(file_obj, password=None):
             if len(all_nums) >= 2:
                 nominal = float(all_nums[0].replace(',', ''))
                 saldo = float(all_nums[-1].replace(',', ''))
+                # Validasi agar saldo tidak sama persis dengan mutasi (mencegah duplikat)
+                if nominal == saldo and len(all_nums) == 2:
+                    saldo = None
             elif len(all_nums) == 1:
                 nominal = float(all_nums[0].replace(',', ''))
                 saldo = None
 
-            if "DB" in combined_text.upper():
+            if "DB" in upper_text:
                 is_db = True
 
         # Bersihkan deskripsi keterangan
@@ -238,7 +253,7 @@ if uploaded_files:
             final_df = final_df.sort_values(by=['Tanggal_DT'], ascending=True).reset_index(drop=True)
             final_df = final_df.drop(columns=['Tanggal_DT'])
 
-            st.subheader("📊 Preview Data (Bunga & Pajak Bunga Lengkap)")
+            st.subheader("📊 Preview Data (Final Sempurna - Pajak Bunga & Saldo Akurat)")
             st.dataframe(final_df, use_container_width=True)
             
             output = BytesIO()
@@ -247,9 +262,9 @@ if uploaded_files:
             processed_data = output.getvalue()
             
             st.download_button(
-                label="📥 Download Excel Lengkap (Bunga & Pajak Bunga)",
+                label="📥 Download Excel Fix Total",
                 data=processed_data,
-                file_name="mutasi_bank_with_tax.xlsx",
+                file_name="mutasi_bank_final_fixed.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         except Exception as e:
