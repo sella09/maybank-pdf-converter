@@ -48,7 +48,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (AUTO-KOREKSI DB/CR)
+# PARSER BCA (SALDO PRESISI & PAJAK BUNGA AMAN)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -72,7 +72,7 @@ def parse_bca(file_bytes, password=None):
     if m_saldo: 
         saldo_awal = to_float(m_saldo.group(1)) or 0.0
 
-    # 2. Pembersihan Teks
+    # 2. Pembersihan Teks Header (Tetap pertahankan BUNGA & PAJAK BUNGA)
     full_text = re.sub(r"KELAPA GADING HALAMAN : \d+ /\d+ KELAPA GADING BARAT JL BOULEVARD RAYA QF 1 NO 7 INDONESIA TANGGAL KETERANGAN CBG MUTASI SALDO", "", full_text, flags=re.IGNORECASE)
     full_text = re.sub(r"KELAPA GADING HALAMAN : \d+ / \d+ KELAPA GADING BARAT JL BOULEVARD RAYA QF 1 NO 7 INDONESIA TANGGAL KETERANGAN CBG MUTASI SALDO", "", full_text, flags=re.IGNORECASE)
     full_text = re.sub(r"Bersambung ke halaman berikut", "", full_text, flags=re.IGNORECASE)
@@ -85,6 +85,7 @@ def parse_bca(file_bytes, password=None):
         if not s: continue
         if any(k in s for k in ["REKENING GIRO", "KCU", "DOMINIC DIGITAL", "NO. REKENING", "PERIODE", "MATA UANG", "CATATAN:", "BCA berhak"]):
             continue
+        # Filter BUNGA dihapus agar PAJAK BUNGA muncul
         clean_lines.append(s)
         
     merged_lines = []
@@ -94,7 +95,7 @@ def parse_bca(file_bytes, password=None):
         elif merged_lines:
             merged_lines[-1] += " " + s
 
-    # 4. Parsing Transaksi & Auto-Koreksi
+    # 4. Parsing Transaksi
     for line in merged_lines:
         m_date = re.match(r"^(\d{2}/\d{2})(.*)", line)
         if not m_date: continue
@@ -110,26 +111,29 @@ def parse_bca(file_bytes, password=None):
         nominal = to_float(nums[0])
         if nominal is None: continue
 
+        # Prioritas ambil saldo dari PDF (angka terakhir di baris)
+        saldo = to_float(nums[-1]) if len(nums) > 1 else None
+        if saldo is not None and (saldo < 0 or saldo > 9999999999):
+            saldo = None
+
         upper_rest = rest.upper()
         
-        # DETEKSI CERDAS
+        # DETEKSI DB / CR
         is_db = False
         
-        # A. Pasti UANG MASUK (CR)
-        cr_markers = ["SETORAN TUNAI", "BI-FAST CR", "TRSF E-BANKING CR", "SWITCHING CR", "KR OTOMATIS", "BUNGA", "REFUND"]
-        
-        # B. Pasti UANG KELUAR (DB)
+        # Uang Masuk (CR)
+        cr_markers = ["SETORAN TUNAI", "BI-FAST CR", "TRSF E-BANKING CR", "SWITCHING CR", "KR OTOMATIS", "BUNGA", "REFUND", "PENERIMAAN NEGARA"]
+        # Uang Keluar (DB)
         db_markers = [
-            "EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA", 
-            "TIGA MUSTIKA KONSU", "PT.FINNET", "PT. FINNET", "BA JASA E-BANKING",
-            "BIAYA ADM", "BIAYA TRANSFER", "BIAYA REFERENSI", "PAJAK BUNGA",
+            "EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "TIGA MUSTIKA KONSU", "PT.FINNET", "PT. FINNET", 
+            "BA JASA E-BANKING", "BIAYA ADM", "BIAYA TRANSFER", "BIAYA REFERENSI", "PAJAK BUNGA",
             "PEMBELIAN", "BY PASANG", "BAYAR", "PENGELUARAN", "SWITCHING DB", "TRSF E-BANKING DB"
         ]
 
-        if any(k in upper_rest for k in cr_markers):
-            is_db = False
-        elif any(k in upper_rest for k in db_markers):
+        if any(k in upper_rest for k in db_markers):
             is_db = True
+        elif any(k in upper_rest for k in cr_markers):
+            is_db = False
         elif "DB" in upper_rest:
             is_db = True
         elif "CR" in upper_rest:
@@ -141,7 +145,6 @@ def parse_bca(file_bytes, password=None):
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
         desc = clean_desc(desc)
 
-        # Pemetaan Anda: DB -> Kredit, CR -> Debit
         debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
 
         transactions.append({
@@ -150,17 +153,20 @@ def parse_bca(file_bytes, password=None):
             "Keterangan": desc,
             "Debit": debit_val, 
             "Kredit": kredit_val,
-            "Saldo": None,
+            "Saldo": saldo,
             "Tipe Asli": "DB" if is_db else "CR",
         })
 
-    # 5. HITUNG RUNNING BALANCE (Rumus: Saldo + Debit - Kredit)
+    # 5. HITUNG RUNNING BALANCE (Hanya untuk baris yang saldonya kosong)
     transactions.sort(key=lambda x: x["Tanggal"])
     
     saldo_berjalan = saldo_awal
     for txn in transactions:
-        saldo_berjalan = saldo_berjalan + txn["Debit"] - txn["Kredit"]
-        txn["Saldo"] = round(saldo_berjalan, 2)
+        if txn["Saldo"] is not None:
+            saldo_berjalan = txn["Saldo"]
+        else:
+            saldo_berjalan = saldo_berjalan + txn["Debit"] - txn["Kredit"]
+            txn["Saldo"] = round(saldo_berjalan, 2)
 
     return transactions
 
@@ -257,7 +263,7 @@ if uploaded_files:
         final_df = final_df.drop(columns=["Tanggal_DT"])
         final_df = final_df[(final_df["Debit"] > 0) | (final_df["Kredit"] > 0)]
 
-        st.subheader("📊 Preview Data (Auto-Koreksi DB/CR)")
+        st.subheader("📊 Preview Data (Saldo Presisi)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
