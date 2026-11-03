@@ -30,6 +30,7 @@ def to_float(num_str):
     if not s or s in ("-", ""): return None
     s = re.sub(r"[^\d.,]", "", s)
     if not s: return None
+    # Format Indonesia 1.234,56 vs English 1,234.56
     if re.search(r",\d{2}$", s) and "." in s:
         s = s.replace(".", "").replace(",", ".")
     else:
@@ -38,34 +39,20 @@ def to_float(num_str):
     except ValueError: return None
 
 def clean_desc(text):
-    """Membersihkan teks keterangan dari noise/footer BCA secara agresif."""
     if not text: return ""
     t = str(text)
-    # Hapus kalimat footer BCA yang sering muncul
-    t = re.sub(
-        r"Rekening ini sampai dengan akhir bulan berikutnya.*?Rekening ini\.",
-        "", t, flags=re.IGNORECASE | re.DOTALL
-    )
-    t = re.sub(
-        r"telah menyetujui segala data.*?Rekening ini\.",
-        "", t, flags=re.IGNORECASE | re.DOTALL
-    )
-    t = re.sub(
-        r"Apabila nasabah tidak melakukan sanggahan.*?Laporan Mutasi Rekening\.",
-        "", t, flags=re.IGNORECASE | re.DOTALL
-    )
-    # Hapus spasi berlebih
-    t = " ".join(t.split())
-    return t.strip()
+    t = re.sub(r"Rekening ini sampai dengan akhir bulan berikutnya.*?Rekening ini\.", "", t, flags=re.IGNORECASE | re.DOTALL)
+    t = re.sub(r"telah menyetujui segala data.*?Rekening ini\.", "", t, flags=re.IGNORECASE | re.DOTALL)
+    t = re.sub(r"Apabila nasabah tidak melakukan sanggahan.*?Laporan Mutasi Rekening\.", "", t, flags=re.IGNORECASE | re.DOTALL)
+    return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (HYBRID: TABEL + TEKS FALLBACK)
+# PARSER BCA
 # =========================================================
 def parse_bca_hybrid(file_obj, password=None):
     transactions = []
     pdf = open_pdf(file_obj, password)
     
-    # 1. DETEKSI TAHUN
     full_text = ""
     for page in pdf.pages:
         t = page.extract_text()
@@ -75,7 +62,7 @@ def parse_bca_hybrid(file_obj, password=None):
     m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", full_text, re.IGNORECASE)
     if m: tahun = m.group(1)
 
-    # 2. COBA EKSTRAK TABEL (Untuk PDF Asli)
+    # --- EKSTRAKSI TABEL ---
     table_rows_found = 0
     for page in pdf.pages:
         tables = page.extract_tables()
@@ -85,7 +72,6 @@ def parse_bca_hybrid(file_obj, password=None):
                 cells = [clean_desc(c) if c else "" for c in row]
                 joined = " | ".join(cells)
                 
-                # cari tanggal DD/MM
                 tgl = None
                 for c in cells:
                     mt = re.match(r"^(\d{2}/\d{2})\b", c)
@@ -96,7 +82,10 @@ def parse_bca_hybrid(file_obj, password=None):
                 
                 row_text = re.sub(r"^\d{2}/\d{2}\s*", "", joined)
                 upper = row_text.upper()
-                if "SALDO AWAL" in upper: continue
+                
+                # Skip saldo awal secara eksplisit
+                if "SALDO AWAL" in upper:
+                    continue
 
                 is_db = bool(re.search(r"\bDB\b", upper))
                 is_cr = bool(re.search(r"\bCR\b", upper))
@@ -111,9 +100,15 @@ def parse_bca_hybrid(file_obj, password=None):
 
                 nominal = to_float(decimals[0]) or 0.0
                 saldo = None
+                
+                # LOGIKA SALDO: Ambil angka terakhir, tapi pastikan itu bukan angka nominal
+                # dan formatnya benar (harus ada titik desimal / ribuan)
                 if len(decimals) >= 2:
-                    saldo_val = to_float(decimals[-1])
-                    if saldo_val is not None and saldo_val != nominal and saldo_val > 0:
+                    saldo_str = decimals[-1]
+                    saldo_val = to_float(saldo_str)
+                    # Filter: saldo harus > 100 (hindari angka kurs USD seperti 6.12)
+                    # dan tidak sama dengan nominal
+                    if saldo_val is not None and saldo_val > 100 and saldo_val != nominal:
                         saldo = saldo_val
 
                 desc = row_text
@@ -130,7 +125,7 @@ def parse_bca_hybrid(file_obj, password=None):
                 })
                 table_rows_found += 1
 
-    # 3. FALLBACK: PARSE TEKS MENTAH (Jika Tabel Kosong / File TXT)
+    # --- FALLBACK: TEKS MENTAH ---
     if table_rows_found == 0:
         lines = full_text.split('\n')
         ignore_keywords = [
@@ -190,18 +185,18 @@ def parse_bca_hybrid(file_obj, password=None):
                 else: nominal = to_float(all_decimals[0]) or 0.0
                 if len(all_decimals) >= 2:
                     saldo_val = to_float(all_decimals[-1])
-                    if saldo_val is not None and saldo_val != nominal: saldo = saldo_val
+                    if saldo_val is not None and saldo_val > 100 and saldo_val != nominal: saldo = saldo_val
             elif "BUNGA" in upper_text and "PAJAK" not in upper_text:
                 is_db = False
                 nominal = to_float(all_decimals[0]) or 0.0
                 if len(all_decimals) >= 2:
                     saldo_val = to_float(all_decimals[-1])
-                    if saldo_val is not None and saldo_val != nominal: saldo = saldo_val
+                    if saldo_val is not None and saldo_val > 100 and saldo_val != nominal: saldo = saldo_val
             else:
                 if len(all_decimals) >= 2:
                     nominal = to_float(all_decimals[0]) or 0.0
                     saldo_val = to_float(all_decimals[-1])
-                    if saldo_val is not None and saldo_val != nominal: saldo = saldo_val
+                    if saldo_val is not None and saldo_val > 100 and saldo_val != nominal: saldo = saldo_val
                 elif len(all_decimals) == 1:
                     nominal = to_float(all_decimals[0]) or 0.0
                 
@@ -228,7 +223,7 @@ def parse_bca_hybrid(file_obj, password=None):
     return transactions
 
 # =========================================================
-# PARSER MAYBANK (Fallback)
+# PARSER MAYBANK
 # =========================================================
 def parse_maybank_statement(file_obj, password=None):
     transactions = []
@@ -250,7 +245,7 @@ def parse_maybank_statement(file_obj, password=None):
         if not parsed: continue
         
         nominal = parsed[0]
-        saldo = parsed[-1] if len(parsed) >= 2 and parsed[-1] != nominal else None
+        saldo = parsed[-1] if len(parsed) >= 2 and parsed[-1] != nominal and parsed[-1] > 100 else None
         is_db = bool(re.search(r"\bDB\b", line_str.upper()))
         desc = re.sub(r"^\d{2}[/-]\d{2}[/-]?\d{0,4}\s*", "", line_str)
         for n in nums: desc = desc.replace(n, "")
@@ -275,8 +270,7 @@ def build_df(transactions, sumber_file):
         "Saldo": t["Saldo"], "Tipe Asli Bank": t["Tipe Asli"]
     } for t in transactions])
     
-    # --- PERBAIKAN 1: Isi Saldo yang kosong (forward fill) ---
-    # Karena BCA hanya menampilkan saldo di akhir halaman, kita pakai ffill
+    # Forward fill saldo HANYA jika saldo kosong
     if not df.empty:
         df["Saldo"] = df["Saldo"].ffill()
     
@@ -319,7 +313,10 @@ if uploaded_files:
         final_df = final_df.sort_values("Tanggal_DT").reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT"])
 
-        st.subheader("📊 Preview Data (Debet ↔ Kredit swapped, Saldo Filled)")
+        # HAPUS baris di mana Debit=0 dan Kredit=0 (transaksi gagal parse)
+        final_df = final_df[(final_df["Debit"] > 0) | (final_df["Kredit"] > 0)]
+
+        st.subheader("📊 Preview Data (Debet ↔ Kredit swapped)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
