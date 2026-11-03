@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Final Fixed)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Clean Parser)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -27,21 +27,32 @@ def parse_bca_perfect(file_obj, password=None):
         tahun = match_thn.group(1)
 
     lines = full_text.split('\n')
-    raw_blocks = []
-    current_block = None
-    date_pattern = re.compile(r"^(\d{2}/\d{2})\s+(.+)")
+    
+    # Kata kunci header/footer BCA yang harus diabaikan
+    ignore_keywords = [
+        "REKENING GIRO", "KCU", "DOMINIC DIGITAL", "KELAPA GADING", "JL BOULEVARD",
+        "JAKARTA", "INDONESIA", "NO. REKENING", "HALAMAN", "PERIODE", "MATA UANG",
+        "CATATAN:", "Apabila nasabah", "BCA berhak", "TANGGAL KETERANGAN", 
+        "Bersambung ke halaman", "SALDO AWAL :", "MUTASI CR :", "MUTASI DB :", "SALDO AKHIR :"
+    ]
 
+    clean_lines = []
     for line in lines:
         line_str = line.strip()
         if not line_str:
             continue
-        if any(skip_kw in line_str.upper() for skip_kw in [
-            "TANGGAL KETERANGAN", "BERSAMBUNG KE", "SALDO AWAL :", "SALDO AWAL",
-            "NO. REKENING", "REKENING GIRO", "HALAMAN", "PERIODE", "CATATAN:",
-            "MUTASI CR :", "MUTASI DB :", "SALDO AKHIR :"
-        ]):
+        # Abaikan baris nomor halaman atau keyword header/footer
+        if re.match(r"^\d+\s*/\s*\d+$", line_str) or (re.match(r"^\d+$", line_str) and len(line_str) <= 3):
             continue
+        if any(kw.lower() in line_str.lower() for kw in ignore_keywords):
+            continue
+        clean_lines.append(line_str)
 
+    raw_blocks = []
+    current_block = None
+    date_pattern = re.compile(r"^(\d{2}/\d{2})\s+(.+)")
+
+    for line_str in clean_lines:
         m_date = date_pattern.match(line_str)
         if m_date:
             if current_block:
@@ -68,7 +79,6 @@ def parse_bca_perfect(file_obj, password=None):
         nominal = 0.0
         is_db = False
 
-        # Penanganan khusus untuk baris BUNGA, PAJAK BUNGA, dan BIAYA ADM
         upper_text = combined_text.upper()
         if "PAJAK BUNGA" in upper_text or "BIAYA ADM" in upper_text:
             db_match = re.search(r"([\d,]+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
@@ -78,17 +88,14 @@ def parse_bca_perfect(file_obj, password=None):
             saldo_str = matches[-1].group(1).replace(',', '')
             saldo = float(saldo_str)
         elif "BUNGA" in upper_text:
-            # Bunga bank biasanya merupakan penambahan (CR) tanpa teks DB
             bunga_match = re.search(r"([\d,]+\.\d{2})", combined_text)
             if bunga_match:
                 nominal = float(bunga_match.group(1).replace(',', ''))
             is_db = False
-            # Jika ada saldo di ujung baris
             if len(matches) >= 2:
                 saldo_str = matches[-1].group(1).replace(',', '')
                 saldo = float(saldo_str)
         else:
-            # Transaksi normal (Transfer / Terima Dana)
             if len(matches) >= 2:
                 saldo_str = matches[-1].group(1).replace(',', '')
                 saldo = float(saldo_str)
@@ -211,7 +218,7 @@ if uploaded_files:
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
         
-        # Pengurutan Kronologis dari Bulan Terkecil (Januari) ke Terbesar
+        # Pengurutan Kronologis dan Pembersihan Tanggal
         try:
             final_df['Tanggal'] = final_df['Tanggal'].astype(str).str.strip()
             final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
@@ -220,7 +227,7 @@ if uploaded_files:
         except Exception as e:
             st.warning(f"Gagal mengurutkan tanggal secara otomatis: {e}")
 
-        st.subheader("📊 Preview Data (Urut Kronologis & Hasil Swap)")
+        st.subheader("📊 Preview Data (Bersih, Urut Kronologis, & Swap)")
         st.dataframe(final_df, use_container_width=True)
         
         output = BytesIO()
@@ -229,7 +236,7 @@ if uploaded_files:
         processed_data = output.getvalue()
         
         st.download_button(
-            label="📥 Download Excel Hasil Swap & Urut",
+            label="📥 Download Excel Bersih & Urut",
             data=processed_data,
             file_name="mutasi_bank_swapped.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
