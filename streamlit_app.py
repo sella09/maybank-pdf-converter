@@ -48,7 +48,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (EKSTRAKSI TABEL ASLI)
+# PARSER BCA (HYBRID: REGEX + AMBIL SALDO ASLI)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -58,71 +58,81 @@ def parse_bca(file_bytes, password=None):
 
     tahun = "2026"
 
-    # 1. Ekstrak baris dari TABEL PDF langsung
     for page in pdf.pages:
-        # Dapatkan tahun dari teks
+        # Dapatkan tahun dari teks halaman pertama
         if page.page_number == 1:
             text = page.extract_text() or ""
             m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", text, re.IGNORECASE)
             if m: tahun = m.group(1)
 
-        # Ekstrak tabel dengan pdfplumber
-        table = page.extract_table()
-        if not table: continue
+        # Ekstrak teks halaman (karena tabel tidak terbaca, kita olah teksnya)
+        text = page.extract_text()
+        if not text: continue
+        
+        lines = text.split("\n")
+        
+        # Gabungkan baris yang terpotong (tidak diawali tanggal)
+        merged_lines = []
+        for line in lines:
+            s = line.strip()
+            if not s: continue
+            # Jika diawali tanggal DD/MM, mulai baris baru. Jika tidak, gabung ke baris sebelumnya.
+            if re.match(r"^\d{2}/\d{2}", s):
+                merged_lines.append(s)
+            elif merged_lines and not any(k in s for k in ["REKENING GIRO", "KCU", "PERIODE", "CATATAN", "HALAMAN"]):
+                merged_lines[-1] += " " + s
 
-        for row in table:
-            # Lewati baris yang kosong atau bukan transaksi
-            if not row or len(row) < 4: continue
+        for line in merged_lines:
+            m_date = re.match(r"^(\d{2}/\d{2})(.*)", line)
+            if not m_date: continue
             
-            tgl_raw = str(row[0]).strip() if row[0] else ""
-            if not re.match(r"^\d{2}/\d{2}$", tgl_raw): continue
+            tgl = m_date.group(1)
+            rest = m_date.group(2).strip()
+
+            # Lewati saldo awal / akhir yang bukan transaksi
+            if "SALDO AWAL" in rest.upper() or "SALDO AKHIR" in rest.upper(): continue
+
+            # Ekstrak semua format angka desimal (titik 2 digit di belakang)
+            nums = re.findall(r"\d[\d,]*\.\d{2}", rest)
+            if not nums: continue
+
+            # Ambil nominal mutasi (angka pertama) dan saldo (angka kedua)
+            nominal = to_float(nums[0])
+            saldo = to_float(nums[1]) if len(nums) > 1 else None
             
-            # Bersihkan sel
-            row = [str(c).replace("\n", " ").strip() if c else "" for c in row]
-            tgl = row[0]
-            desc = row[1]
-            
-            # Mutasi biasanya di col 2, Saldo di col 3 (sesuai visual tabel BCA)
-            mutasi_str = row[2] if len(row) > 2 else ""
-            saldo_str = row[3] if len(row) > 3 else ""
-
-            saldo_val = to_float(saldo_str)
-            mutasi_val = to_float(mutasi_str)
-
-            # Jika saldo tidak ada, berarti baris ini bukan transaksi valid / header
-            if saldo_val is None: continue
-
             # Deteksi DB / CR
-            upper_desc = desc.upper()
+            upper_rest = rest.upper()
             is_db = False
-            if "DB" in upper_desc or "DB" in mutasi_str.upper():
+            if "DB" in upper_rest:
                 is_db = True
             else:
-                # Cadangan jika DB tidak tertulis eksplisit di kolom teks
                 db_keywords = ["EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA",
                                "TIGA MUSTIKA KONSU", "PT.FINNET", "PT. FINNET", "BA JASA E-BANKING",
                                "BIAYA ADM", "BIAYA TRANSFER", "BIAYA REFERENSI", "SWITCHING KE",
                                "SWITCHING TRANSFER KE", "BI-FAST BIF TRANSFER KE",
                                "BI-FAST BIF BIAYA TXN KE", "OTOMATIS", "FEE TELEX", "FEE FULL AMT",
                                "FEE VALUE TDY", "PAJAK BUNGA"]
-                if any(k in upper_desc for k in db_keywords):
+                if any(k in upper_rest for k in db_keywords):
                     is_db = True
 
-            # Bersihkan deskripsi
-            clean_keterangan = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
-            clean_keterangan = clean_desc(clean_keterangan)
+            # Bersihkan deskripsi dari angka dan kata DB/CR
+            desc = rest
+            for n in nums:
+                desc = desc.replace(n, "")
+            desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
+            desc = clean_desc(desc)
 
             # Pemetaan Anda: DB -> Kredit, CR -> Debit
-            debit_val, kredit_val = (0.0, mutasi_val) if is_db else (mutasi_val, 0.0)
+            debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
 
             transactions.append({
-                "Tanggal": f"{tgl}/{tahun}",
-                "Kode": "-",
-                "Keterangan": clean_keterangan,
-                "Debit": debit_val,
+                "Tanggal": f"{tgl}/{tahun}", 
+                "Kode": "-", 
+                "Keterangan": desc,
+                "Debit": debit_val, 
                 "Kredit": kredit_val,
-                "Saldo": saldo_val,
-                "Tipe Asli": "DB" if is_db else "CR"
+                "Saldo": saldo, 
+                "Tipe Asli": "DB" if is_db else "CR",
             })
 
     pdf.close()
