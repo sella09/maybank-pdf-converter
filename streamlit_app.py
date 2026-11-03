@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Final Precision)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Precision Fix)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -68,8 +68,7 @@ def parse_bca_perfect(file_obj, password=None):
     for block in raw_blocks:
         combined_text = " ".join(block["lines"])
         
-        # PENTING: Hanya ambil angka yang memiliki pemisah koma ribuan yang valid (misal: 1,387,500.00)
-        # agar tidak keliru membaca kode referensi mentah tanpa koma.
+        # Ekstrak angka yang memiliki koma pemisah ribuan yang valid (format mata uang resmi)
         pattern_amount = r"(\d{1,3}(?:,\d{3})+\.\d{2})\s*(DB)?"
         matches = list(re.finditer(pattern_amount, combined_text, flags=re.IGNORECASE))
         
@@ -97,9 +96,12 @@ def parse_bca_perfect(file_obj, password=None):
                 saldo_str = matches[-1].group(1).replace(',', '')
                 saldo = float(saldo_str)
         else:
+            # Transaksi normal: 
+            # Jika ada 2 atau lebih angka berformat koma, angka terakhir = Saldo, angka sebelumnya = Mutasi
             if len(matches) >= 2:
                 saldo_str = matches[-1].group(1).replace(',', '')
                 saldo = float(saldo_str)
+                
                 mutasi_match = matches[-2]
                 nominal = float(mutasi_match.group(1).replace(',', ''))
                 if mutasi_match.group(2) and mutasi_match.group(2).upper() == 'DB':
@@ -117,7 +119,8 @@ def parse_bca_perfect(file_obj, password=None):
         desc = re.sub(r"\bDB\b", "", desc, flags=re.IGNORECASE)
         desc = " ".join(desc.split()).strip()
 
-        # Logika Swap Debet <-> Kredit
+        # LOGIKA PEMBALIKAN (SWAP DEBET <-> KREDIT):
+        # Sesuai permintaan: Nominal Debet dipindah ke Kredit, dan Kredit ke Debet.
         if is_db:
             debet_swap = 0.0
             kredit_swap = nominal
@@ -228,7 +231,7 @@ if uploaded_files:
         except Exception as e:
             st.warning(f"Gagal mengurutkan tanggal secara otomatis: {e}")
 
-        st.subheader("📊 Preview Data (Presisi, Urut Kronologis, & Swap)")
+        st.subheader("📊 Preview Data (Presisi & Urut Kronologis)")
         st.dataframe(final_df, use_container_width=True)
         
         output = BytesIO()
