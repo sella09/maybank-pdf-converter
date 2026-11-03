@@ -51,7 +51,7 @@ def clean_desc(text):
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (TEKS UTUH LAYOUT)
+# PARSER BCA (SAPU BERSIH)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -67,7 +67,7 @@ def parse_bca(file_bytes, password=None):
             m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", text, re.IGNORECASE)
             if m: tahun = m.group(1)
 
-        # Mengambil teks dengan layout asli (spasi terjaga)
+        # Ambil layout text utuh
         layout_text = page.extract_text(layout=True)
         if not layout_text: continue
 
@@ -80,7 +80,6 @@ def parse_bca(file_bytes, password=None):
             if any(k in line_str.upper() for k in ["REKENING GIRO", "KCIU RAWAMANGUN", "NO. REKENING", "PERIODE :", "MATA UANG", "CATATAN:", "BCA BERHAK"]):
                 continue
 
-            # Cek apakah baris ini memulai transaksi baru (diawali DD/MM)
             m_date = re.match(r"^(\d{2}/\d{2})\s+(.+)", line_str)
             
             if m_date:
@@ -91,47 +90,68 @@ def parse_bca(file_bytes, password=None):
                 tgl = m_date.group(1)
                 rest_text = m_date.group(2)
 
-                # Ekstrak angka murni (format 1.000.000.00 atau 1000.00)
-                nums_raw = re.findall(r"\b\d{1,3}(?:,\d{3})*\.\d{2}\b|\b\d+\.\d{2}\b", rest_text)
-                nums = [to_float(n) for n in nums_raw]
-
-                # Hapus angka dari teks untuk dijadikan keterangan
-                desc_text = rest_text
-                for n in nums_raw:
-                    desc_text = desc_text.replace(n, "")
+                # Pisahkan teks dan angka menggunakan split spasi
+                parts = rest_text.split()
+                desc_words = []
+                nums = []
+                for p in parts:
+                    if re.match(r"^\d[\d,]*\.\d{2}$", p):
+                        nums.append(to_float(p))
+                    else:
+                        desc_words.append(p)
                 
+                desc_text = " ".join(desc_words)
                 upper_desc = desc_text.upper()
 
-                # Deteksi DB/CR
+                # Logika Debit / Kredit BCA
                 is_db = False
                 if any(k in upper_desc for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA"]):
                     is_db = True
-                elif "TRSF E-BANKING DB" in upper_desc:
+                elif "TRSF E-BANKING DB" in upper_desc or "SWITCHING DB" in upper_desc:
                     is_db = True
+
+                # Tentukan Nominal & Saldo
+                if len(nums) >= 2:
+                    nominal = nums[0]
+                    saldo = nums[-1]
+                elif len(nums) == 1:
+                    nominal = nums[0]
+                    saldo = None
+                else:
+                    nominal = 0.0
+                    saldo = None
+
+                debit_val = nominal if is_db else 0.0
+                kredit_val = nominal if not is_db else 0.0
+
+                if "BUNGA" in upper_desc and "PAJAK" not in upper_desc:
+                    debit_val, kredit_val = 0.0, nominal
 
                 current_txn = {
                     "Tanggal": f"{tgl}/{tahun}",
                     "Kode": "-",
                     "Keterangan": desc_text,
-                    "Debit": 0.0,
-                    "Kredit": 0.0,
-                    "Saldo": None,
-                    "Nums": nums, # Simpan dulu angkanya
+                    "Debit": debit_val,
+                    "Kredit": kredit_val,
+                    "Saldo": saldo,
                     "_order": order,
                 }
                 order += 1
 
             else:
-                # Ini baris lanjutan
+                # Baris lanjutan (Nama PT, Alamat, Nominal nyasar)
                 if current_txn:
-                    current_txn["Keterangan"] += " " + line_str
-                    
-                    # Cek jika di baris lanjutan ini ternyata ada angka (misal 7194000.00)
-                    nums_raw = re.findall(r"\b\d{1,3}(?:,\d{3})*\.\d{2}\b|\b\d+\.\d{2}\b", line_str)
-                    if nums_raw:
-                        for n in nums_raw:
-                            current_txn["Nums"].append(to_float(n))
-                            current_txn["Keterangan"] = current_txn["Keterangan"].replace(n, "")
+                    extra_parts = line_str.split()
+                    for p in extra_parts:
+                        if re.match(r"^\d[\d,]*\.\d{2}$", p):
+                            val = to_float(p)
+                            # Jika saldo belum ada, isi saldo. Jika sudah, biarkan.
+                            if current_txn["Saldo"] is None and current_txn["Debit"] == 0 and current_txn["Kredit"] == 0:
+                                current_txn["Saldo"] = val
+                            elif current_txn["Debit"] == 0 and current_txn["Kredit"] == 0:
+                                current_txn["Debit"] = val
+                        else:
+                            current_txn["Keterangan"] += " " + p
 
         if current_txn:
             current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
@@ -140,41 +160,23 @@ def parse_bca(file_bytes, password=None):
 
     pdf.close()
 
-    # PROSES AKHIR: TENTUKAN NOMINAL, SALDO, DAN DEBIT/KREDIT
+    # Validasi Matematika Ganda (Paksa Benar)
+    saldo_berjalan = 0.0
     for txn in transactions:
-        nums = txn["Nums"]
-        del txn["Nums"] # Hapus dari output akhir
-
-        upper_text = txn["Keterangan"].upper()
-
-        # Aturan Utama BCA
-        is_db = False
-        if any(k in upper_text for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA", "SWITCHING KE", "SWITCHING TRANSFER KE", "TRSF E-BANKING DB"]):
-            is_db = True
-            
-        # Tentukan Nominal dan Saldo
-        # Asumsi: Angka pertama = Nominal, Angka terakhir = Saldo
-        if len(nums) >= 2:
-            nominal = nums[0]
-            saldo = nums[-1]
-        elif len(nums) == 1:
-            nominal = nums[0]
-            saldo = None
+        if txn["Saldo"] is None:
+            txn["Saldo"] = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
         else:
-            nominal = 0.0
-            saldo = None
+            if saldo_berjalan != 0.0:
+                expected = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
+                if abs(expected - txn["Saldo"]) > 1.0:
+                    expected_swap = round(saldo_berjalan + txn["Debit"] - txn["Kredit"], 2)
+                    if abs(expected_swap - txn["Saldo"]) <= 1.0:
+                        txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"]
+        
+        # Update saldo berjalan
+        saldo_berjalan = txn["Saldo"]
 
-        debit_val = nominal if is_db else 0.0
-        kredit_val = nominal if not is_db else 0.0
-
-        if "BUNGA" in upper_text and "PAJAK" not in upper_text:
-            debit_val, kredit_val = 0.0, nominal
-
-        txn["Debit"] = debit_val
-        txn["Kredit"] = kredit_val
-        txn["Saldo"] = saldo
-
-        # Bersihkan sisa teks
+        # Bersihkan teks
         txn["Keterangan"] = re.sub(r"\bDB\b|\bCR\b", "", txn["Keterangan"]).strip()
         txn["Keterangan"] = re.sub(r"\b\d{4}/[A-Z0-9/]+\b", "", txn["Keterangan"]).strip()
         txn["Keterangan"] = " ".join(txn["Keterangan"].split())
@@ -281,7 +283,7 @@ if uploaded_files:
         final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
 
-        st.subheader("📊 Preview Data (Bersih Total)")
+        st.subheader("📊 Preview Data (Bersih & Akurat)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
@@ -291,6 +293,6 @@ if uploaded_files:
         st.download_button(
             "📥 Download Excel",
             data=output.getvalue(),
-            file_name="mutasi_bank_fixed_grid_final.xlsx",
+            file_name="mutasi_bank_final_clean.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
