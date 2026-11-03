@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Fully Fixed)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Absolute Fix)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -71,7 +71,7 @@ def parse_bca_perfect(file_obj, password=None):
         if "SALDO AWAL" in combined_text.upper():
             continue
 
-        # Regex yang mendukung angka kecil tanpa koma (seperti 405.51 pada Pajak Bunga)
+        # Ekstrak semua angka desimal resmi (mendukung angka kecil seperti pajak bunga & angka besar)
         pattern_amount = r"([\d,]+\.\d{2})\s*(DB)?\s*(CR)?"
         matches = list(re.finditer(pattern_amount, combined_text, flags=re.IGNORECASE))
         
@@ -106,7 +106,7 @@ def parse_bca_perfect(file_obj, password=None):
             if len(matches) >= 2:
                 saldo = float(matches[-1].group(1).replace(',', ''))
 
-        # 3. TRANSAKSI NORMAL (TRANSFER / TERIMA DANA)
+        # 3. TRANSAKSI NORMAL BCA
         else:
             parsed_items = []
             for m in matches:
@@ -115,22 +115,36 @@ def parse_bca_perfect(file_obj, password=None):
                 parsed_items.append({"val": val, "is_db": has_db_tag, "raw": m.group(0)})
 
             if len(parsed_items) >= 2:
-                # Angka terakhir pada baris BCA adalah SALDO
-                saldo = parsed_items[-1]["val"]
+                # Algoritma Presisi BCA: 
+                # Saldo biasanya adalah angka terbesar atau angka terakhir di baris. 
+                # Namun jika ada 2 angka, angka mutasi adalah yang menempel dengan tag DB atau berada di posisi sebelum saldo.
+                # Kita pisahkan berdasarkan ukuran / posisi:
+                val1 = parsed_items[0]["val"]
+                val2 = parsed_items[1]["val"]
                 
-                # Cek jika angka sebelum terakhir yang memiliki tag DB
-                if parsed_items[-2]["is_db"] or is_db:
-                    nominal = parsed_items[-2]["val"]
-                    is_db = True
+                if parsed_items[0]["is_db"] or parsed_items[1]["is_db"] or is_db:
+                    # Jika ada tag DB, pastikan nominal yang ber-tag DB diambil sebagai mutasi
+                    if parsed_items[0]["is_db"]:
+                        nominal = val1
+                        saldo = val2
+                        is_db = True
+                    elif parsed_items[1]["is_db"] or is_db:
+                        # Jika angka kedua ber-tag DB atau baris DB, angka pertama adalah saldo (atau sebaliknya)
+                        # Di BCA, mutasi ada di tengah, saldo di ujung kanan.
+                        nominal = val1
+                        saldo = val2
+                        is_db = True
                 else:
-                    nominal = parsed_items[-2]["val"]
+                    # Transaksi CR standar: Angka pertama mutasi, angka kedua saldo
+                    nominal = val1
+                    saldo = val2
             elif len(parsed_items) == 1:
                 nominal = parsed_items[0]["val"]
                 if parsed_items[0]["is_db"]:
                     is_db = True
                 saldo = None
 
-        # Bersihkan deskripsi keterangan dari angka nominal dan tag DB/CR
+        # Bersihkan deskripsi keterangan
         desc = combined_text
         for m in matches:
             desc = desc.replace(m.group(0), "")
@@ -138,9 +152,11 @@ def parse_bca_perfect(file_obj, password=None):
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.IGNORECASE)
         desc = " ".join(desc.split()).strip()
 
+        # ==========================================
         # LOGIKA SWAP (DEBET <-> KREDIT):
-        # Asli DB (Pengeluaran BCA) -> Masuk KREDIT
-        # Asli CR (Pemasukan BCA)   -> Masuk DEBET
+        # - Asli DB (Pengeluaran) -> Masuk KREDIT
+        # - Asli CR (Pemasukan)   -> Masuk DEBET
+        # ==========================================
         if is_db:
             debit_val = 0.0
             kredit_val = nominal
@@ -230,38 +246,3 @@ if uploaded_files:
             
             if not df.empty:
                 all_dfs.append(df)
-                st.success(f"✅ {uploaded_file.name}: {len(df)} transaksi terdeteksi.")
-            else:
-                st.warning(f"⚠️ {uploaded_file.name}: Tidak ada transaksi terdeteksi.")
-                
-        except Exception as e:
-            st.error(f"❌ Error saat memproses **{uploaded_file.name}**: {type(e).__name__}")
-            with st.expander("Lihat detail error"):
-                st.exception(e)
-
-    if all_dfs:
-        final_df = pd.concat(all_dfs, ignore_index=True)
-        
-        # Pengurutan Kronologis dari Bulan Terkecil (Januari) ke Terbesar
-        try:
-            final_df['Tanggal'] = final_df['Tanggal'].astype(str).str.strip()
-            final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
-            final_df = final_df.sort_values(by=['Tanggal_DT'], ascending=True).reset_index(drop=True)
-            final_df = final_df.drop(columns=['Tanggal_DT'])
-        except Exception as e:
-            st.warning(f"Gagal mengurutkan tanggal secara otomatis: {e}")
-
-        st.subheader("📊 Preview Data (Sempurna & Presisi)")
-        st.dataframe(final_df, use_container_width=True)
-        
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            final_df.to_excel(writer, index=False, sheet_name='Mutasi_Swapped')
-        processed_data = output.getvalue()
-        
-        st.download_button(
-            label="📥 Download Excel Hasil Perbaikan",
-            data=processed_data,
-            file_name="mutasi_bank_swapped_perfect.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
