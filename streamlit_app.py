@@ -44,18 +44,16 @@ def to_float(num_str):
 def clean_desc(text):
     if not text: return ""
     t = str(text)
-    # Hapus teks footer/header
     t = re.sub(r"Bersambung ke halaman berikut\.?", "", t, flags=re.I)
     t = re.sub(r"SALDO\s+AWAL\s*:.*?(SALDO\s+AKHIR\s*:.*)?", "", t, flags=re.I)
     t = re.sub(r"CATATAN\s*:.*?Rekening\.?", "", t, flags=re.I | re.S)
     t = re.sub(r"HALAMAN\s*:.*?IDR", "", t, flags=re.I)
-    # Hapus semua angka desimal dan kode referensi panjang
-    t = re.sub(r"\d[\d,]*\.\d{2}", "", t) 
+    # Buang nomor referensi panjang
     t = re.sub(r"[A-Z0-9]{10,}", "", t) 
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (PENDEKATAN BARIS & MATEMATIKA MUTLAK)
+# PARSER BCA (MUTLAK MEMBALIK DEBIT/KREDIT)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -63,7 +61,6 @@ def parse_bca(file_bytes, password=None):
     pdf = open_pdf(file_obj, password)
     transactions = []
     tahun = "2026"
-    saldo_awal_global = 0.0
     order = 0
 
     for page in pdf.pages:
@@ -71,8 +68,6 @@ def parse_bca(file_bytes, password=None):
             text = page.extract_text() or ""
             m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", text, re.IGNORECASE)
             if m: tahun = m.group(1)
-            m_saldo = re.search(r"SALDO\s+AWAL\s*[\n:]?\s*([\d,.]+)", text, re.IGNORECASE)
-            if m_saldo: saldo_awal_global = to_float(m_saldo.group(1))
 
         words = page.extract_words(keep_blank_chars=True)
         lines = {}
@@ -101,7 +96,7 @@ def parse_bca(file_bytes, password=None):
                 rest_text = m_date.group(2)
                 upper_rest = rest_text.upper()
 
-                # Ekstrak angka (Mutasi dan Saldo) mutlak dari seluruh baris
+                # Ekstrak angka (Nominal dan Saldo)
                 nums_raw = re.findall(r"\d[\d,]*\.\d{2}", row_text)
                 nums = [to_float(n) for n in nums_raw]
                 
@@ -115,23 +110,31 @@ def parse_bca(file_bytes, password=None):
                     nominal = 0.0
                     saldo = None
 
-                # LOGIKA DEBIT / KREDIT BCA YANG SEBENARNYA
-                is_db = False
-                # Debit (Uang Keluar)
-                if any(k in upper_rest for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA"]):
-                    is_db = True
-                elif "TRSF E-BANKING DB" in upper_rest:
-                    is_db = True
+                # === LOGIKA PEMBALIKAN MUTLAK ===
+                # Jika di PDF aslinya ini adalah CR / Uang Masuk (BI-FAST, TRSF CR)
+                # Kita PAKSA masuk ke DEBIT (Uang Keluar).
+                # Jika di PDF aslinya ini DB (EDDY SUFENDI), kita PAKSA masuk ke KREDIT.
                 
-                debit_val = nominal if is_db else 0.0
-                kredit_val = nominal if not is_db else 0.0
+                is_original_db = False
+                if any(k in upper_rest for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA"]):
+                    is_original_db = True
+                elif "TRSF E-BANKING DB" in upper_rest:
+                    is_original_db = True
 
-                # Bersihkan teks keterangan
-                desc_text = rest_text
+                # BALIK POSISINYA
+                if is_original_db:
+                    # Aslinya Debit, kita jadikan Kredit
+                    debit_val = 0.0
+                    kredit_val = nominal
+                else:
+                    # Aslinya Kredit, kita jadikan Debit
+                    debit_val = nominal
+                    kredit_val = 0.0
+
                 current_txn = {
                     "Tanggal": f"{tgl}/{tahun}",
                     "Kode": "-",
-                    "Keterangan": desc_text,
+                    "Keterangan": rest_text,
                     "Debit": debit_val,
                     "Kredit": kredit_val,
                     "Saldo": saldo,
@@ -140,7 +143,6 @@ def parse_bca(file_bytes, password=None):
                 order += 1
 
             else:
-                # Baris lanjutan (bukan tanggal)
                 if current_txn:
                     current_txn["Keterangan"] += " " + row_text
 
@@ -151,22 +153,6 @@ def parse_bca(file_bytes, password=None):
 
     pdf.close()
 
-    # === VALIDASI MATEMATIKA (Memastikan tidak ada yang kebalik) ===
-    saldo_berjalan = saldo_awal_global
-    for txn in transactions:
-        if txn["Saldo"] is None:
-            txn["Saldo"] = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
-            saldo_berjalan = txn["Saldo"]
-        else:
-            # Cek apakah hitungan cocok
-            expected = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
-            if abs(expected - txn["Saldo"]) > 1.0:
-                # Jika tidak cocok, paksa balik Debit/Kreditnya
-                expected_swap = round(saldo_berjalan + txn["Debit"] - txn["Kredit"], 2)
-                if abs(expected_swap - txn["Saldo"]) <= 1.0:
-                    txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"] # TUKAR!
-            saldo_berjalan = txn["Saldo"]
-
     for txn in transactions:
         if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
         elif txn["Kredit"] > 0: txn["Tipe Asli"] = "CR"
@@ -175,7 +161,7 @@ def parse_bca(file_bytes, password=None):
     return transactions
 
 # =========================================================
-# PARSER MAYBANK
+# PARSER MAYBANK (TIDAK DIUBAH)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_maybank(file_bytes, password=None):
@@ -270,7 +256,7 @@ if uploaded_files:
         final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
 
-        st.subheader("📊 Preview Data")
+        st.subheader("📊 Preview Data (Debit & Kredit Dibalik Total)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
