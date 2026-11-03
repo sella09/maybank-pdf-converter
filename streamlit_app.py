@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Clean & Perfect)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Fully Fixed)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -71,7 +71,7 @@ def parse_bca_perfect(file_obj, password=None):
         if "SALDO AWAL" in combined_text.upper():
             continue
 
-        # Tangkap semua angka berformat desimal (.00 atau .51 dsb) di baris tersebut
+        # Pattern untuk ekstrak angka desimal resmi BCA
         pattern_amount = r"([\d,]+\.\d{2})\s*(DB)?\s*(CR)?"
         matches = list(re.finditer(pattern_amount, combined_text, flags=re.IGNORECASE))
         
@@ -83,6 +83,11 @@ def parse_bca_perfect(file_obj, password=None):
         is_db = False
         upper_text = combined_text.upper()
 
+        # Cek penanda DB eksplisit
+        if " DB" in upper_text or "DB " in upper_text or upper_text.endswith("DB"):
+            is_db = True
+
+        # 1. BARIS PAJAK BUNGA & BIAYA ADM
         if "PAJAK BUNGA" in upper_text or "BIAYA ADM" in upper_text:
             db_match = re.search(r"([\d,]+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
             if db_match:
@@ -90,6 +95,8 @@ def parse_bca_perfect(file_obj, password=None):
                 is_db = True
             if len(matches) >= 2:
                 saldo = float(matches[-1].group(1).replace(',', ''))
+        
+        # 2. BARIS BUNGA
         elif "BUNGA" in upper_text and "PAJAK" not in upper_text:
             bunga_match = re.search(r"([\d,]+\.\d{2})", combined_text)
             if bunga_match:
@@ -97,32 +104,33 @@ def parse_bca_perfect(file_obj, password=None):
             is_db = False
             if len(matches) >= 2:
                 saldo = float(matches[-1].group(1).replace(',', ''))
+
+        # 3. TRANSAKSI NORMAL (TRANSFER / TERIMA DANA)
         else:
-            valid_amounts = []
+            # Ambil semua pasangan angka desimal yang terdeteksi
+            parsed_items = []
             for m in matches:
-                val_str = m.group(1).replace(',', '')
-                try:
-                    val = float(val_str)
-                    is_row_db = bool(m.group(2) and m.group(2).upper() == 'DB') or ("DB" in combined_text.upper() and len(matches) == 1)
-                    valid_amounts.append((val, is_row_db, m.group(0)))
-                except:
-                    pass
+                val = float(m.group(1).replace(',', ''))
+                has_db_tag = bool(m.group(2) and m.group(2).upper() == 'DB')
+                parsed_items.append({"val": val, "is_db": has_db_tag, "raw": m.group(0)})
 
-            # Deteksi apakah baris ini bertuliskan DB di teksnya
-            if " DB" in upper_text or upper_text.endswith("DB"):
-                is_db = True
-
-            if len(valid_amounts) >= 2:
-                saldo = valid_amounts[-1][0]
-                nominal = valid_amounts[-2][0]
-                # Jika baris mengandung teks DB eksplisit
-                if " DB" in upper_text:
+            if len(parsed_items) >= 2:
+                # Angka terakhir pada baris BCA selalu SALDO
+                saldo = parsed_items[-1]["val"]
+                
+                # Angka sebelum terakhir (atau yang berlabel DB) adalah NOMINAL MUTASI
+                if parsed_items[-2]["is_db"] or is_db:
+                    nominal = parsed_items[-2]["val"]
                     is_db = True
-            elif len(valid_amounts) == 1:
-                nominal = valid_amounts[0][0]
-                is_db = valid_amounts[0][1]
+                else:
+                    nominal = parsed_items[-2]["val"]
+            elif len(parsed_items) == 1:
+                nominal = parsed_items[0]["val"]
+                if parsed_items[0]["is_db"]:
+                    is_db = True
+                saldo = None
 
-        # BERSIHKAN DESKRIPSI: Hapus semua angka nominal dan tag DB/CR dari teks keterangan
+        # Bersihkan deskripsi dari angka nominal dan tag DB/CR
         desc = combined_text
         for m in matches:
             desc = desc.replace(m.group(0), "")
@@ -131,6 +139,8 @@ def parse_bca_perfect(file_obj, password=None):
         desc = " ".join(desc.split()).strip()
 
         # LOGIKA SWAP (DEBET <-> KREDIT):
+        # Transaksi Asli DB (Pengeluaran) -> Masuk KREDIT
+        # Transaksi Asli CR (Pemasukan)   -> Masuk DEBET
         if is_db:
             debit_val = 0.0
             kredit_val = nominal
@@ -241,7 +251,7 @@ if uploaded_files:
         except Exception as e:
             st.warning(f"Gagal mengurutkan tanggal secara otomatis: {e}")
 
-        st.subheader("📊 Preview Data (Bersih & Sempurna)")
+        st.subheader("📊 Preview Data (Terurut Kronologis & Fixed)")
         st.dataframe(final_df, use_container_width=True)
         
         output = BytesIO()
@@ -250,8 +260,8 @@ if uploaded_files:
         processed_data = output.getvalue()
         
         st.download_button(
-            label="📥 Download Excel Bersih & Sempurna",
+            label="📥 Download Excel Perbaikan Final",
             data=processed_data,
-            file_name="mutasi_bank_clean_final.xlsx",
+            file_name="mutasi_bank_swapped_perfect.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
