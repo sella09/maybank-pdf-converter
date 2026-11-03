@@ -7,3 +7,5 @@ pdf2image
 Pillow
 opencv-python-headless
 numpy
+camelot-py[cv]
+ghostscript
