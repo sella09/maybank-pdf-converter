@@ -44,16 +44,14 @@ def to_float(num_str):
 def clean_desc(text):
     if not text: return ""
     t = str(text)
-    # Bersihkan teks footer/header
     t = re.sub(r"Bersambung ke halaman berikut\.?", "", t, flags=re.I)
     t = re.sub(r"SALDO\s+AWAL\s*:.*?(SALDO\s+AKHIR\s*:.*)?", "", t, flags=re.I)
-    t = re.sub(r"MUTASI\s*(CR|DB)?\s*:.*?(SALDO\s+AKHIR\s*:.*)?", "", t, flags=re.I)
     t = re.sub(r"CATATAN\s*:.*?Rekening\.?", "", t, flags=re.I | re.S)
     t = re.sub(r"HALAMAN\s*:.*?IDR", "", t, flags=re.I)
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (BERBASIS KOORDINAT X & Y)
+# PARSER BCA (DIPERBAIKI TOTAL)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -74,7 +72,7 @@ def parse_bca(file_bytes, password=None):
 
         words = page.extract_words(keep_blank_chars=True)
         
-        # Kelompokkan kata berdasarkan baris (Y)
+        # Kelompokkan berdasarkan Y (baris)
         lines = {}
         for w in words:
             y = round(w['top'], 1)
@@ -87,15 +85,13 @@ def parse_bca(file_bytes, password=None):
             row = sorted(lines[y], key=lambda w: w['x0'])
             row_text = " ".join([w['text'] for w in row])
 
-            # Lewati baris footer/header
             if any(k in row_text.upper() for k in ["REKENING GIRO", "KCIU RAWAMANGUN", "NO. REKENING", "PERIODE :", "MATA UANG", "CATATAN:", "BCA BERHAK"]):
                 continue
 
-            # Apakah baris ini transaksi baru? (Diawali DD/MM)
+            # Deteksi awal transaksi (Tanggal DD/MM)
             m_date = re.match(r"^(\d{2}/\d{2})\s+(.+)", row_text)
             
             if m_date:
-                # Simpan transaksi sebelumnya jika ada
                 if current_txn:
                     current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
                     transactions.append(current_txn)
@@ -104,13 +100,11 @@ def parse_bca(file_bytes, password=None):
                 rest_text = m_date.group(2)
                 upper_rest = rest_text.upper()
 
-                # Pemisahan kolom berdasarkan X
-                # BCA: Teks di kiri (< 250), Nominal (250-400), Saldo (> 400)
-                desc_words = [w['text'] for w in row if w['x0'] < 400 and not re.match(r"^\d[\d,]*\.\d{2}$", w['text'])]
+                # PISAHKAN NOMINAL DAN SALDO BERDASARKAN POSISI X
                 nums = [w for w in row if re.match(r"^\d[\d,]*\.\d{2}$", w['text'])]
+                nums = sorted(nums, key=lambda w: w['x0'])
 
                 if len(nums) >= 2:
-                    nums = sorted(nums, key=lambda w: w['x0'])
                     nominal = to_float(nums[0]['text'])
                     saldo = to_float(nums[-1]['text'])
                 elif len(nums) == 1:
@@ -120,26 +114,28 @@ def parse_bca(file_bytes, password=None):
                     nominal = 0.0
                     saldo = None
 
-                # Deteksi DB/CR dari teks
+                # === LOGIKA DEBIT / KREDIT BCA YANG BENAR ===
                 is_db = False
-                if re.search(r"\bDB\b", upper_rest) or "EDDY SUFENDI" in upper_rest:
+                # 1. Prioritas Utama: Kata Kunci DB
+                if any(k in upper_rest for k in ["EDDY SUFENDI", "TRSF E-BANKING DB", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "KR OTOMATIS", "ND-LAINNYA", "BYR VIA E-BANKING"]):
                     is_db = True
-                elif any(k in upper_rest for k in ["PAJAK BUNGA", "BIAYA ADM", "BIAYA TRANSFER", "PENERIMAAN NEGARA", "BA JASA E-BANKING", "OTOMATIS"]):
+                # 2. Kata Kunci CR (Uang Masuk)
+                elif any(k in upper_rest for k in ["BI-FAST CR", "BI-FAST BIF TRANSFER DR", "TRSF E-BANKING CR", "SETORAN TUNAI", "BUNGA"]):
+                    is_db = False
+                # 3. Fallback
+                elif re.search(r"\bDB\b", upper_rest):
                     is_db = True
+                elif re.search(r"\bCR\b", upper_rest):
+                    is_db = False
 
                 debit_val = nominal if is_db else 0.0
                 kredit_val = nominal if not is_db else 0.0
 
-                # Khusus Bunga (masuk kredit)
-                if "BUNGA" in upper_rest and "PAJAK" not in upper_rest:
-                    debit_val = 0.0
-                    kredit_val = nominal
-
-                # Bersihkan teks keterangan dari angka dan DB/CR
-                desc_text = rest_text
-                desc_text = re.sub(r"\b\d[\d,]*\.\d{2}\b", "", desc_text)
+                # Keterangan: Hanya ambil teks yang ada di kolom kiri (X < 400)
+                desc_words = [w['text'] for w in row if w['x0'] < 400 and not re.match(r"^\d[\d,]*\.\d{2}$", w['text'])]
+                desc_text = " ".join(desc_words)
                 desc_text = re.sub(r"\bDB\b|\bCR\b", "", desc_text, flags=re.I)
-                
+
                 current_txn = {
                     "Tanggal": f"{tgl}/{tahun}",
                     "Kode": "-",
@@ -152,9 +148,9 @@ def parse_bca(file_bytes, password=None):
                 order += 1
 
             else:
-                # Baris ini BUKAN tanggal. Berarti lanjutan keterangan.
+                # Baris Lanjutan (Bukan Tanggal)
                 if current_txn:
-                    # Ambil teks yang posisinya di kolom keterangan (X < 400)
+                    # Ambil teks di kolom kiri (X < 400) untuk melengkapi keterangan
                     extra_words = [w['text'] for w in row if w['x0'] < 400 and not re.match(r"^\d[\d,]*\.\d{2}$", w['text'])]
                     if extra_words:
                         current_txn["Keterangan"] += " " + " ".join(extra_words)
@@ -166,24 +162,22 @@ def parse_bca(file_bytes, password=None):
 
     pdf.close()
 
-    # === VALIDASI MATEMATIKA (Anti Debit/Kredit Kebalik) ===
+    # === VALIDASI MATEMATIKA (Memastikan tidak ada yang kebalik) ===
     saldo_berjalan = saldo_awal_global
     for txn in transactions:
         if txn["Saldo"] is None:
             txn["Saldo"] = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
             saldo_berjalan = txn["Saldo"]
         else:
-            # Cek apakah hitungan cocok
+            # Cek hitungan normal
             expected = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
             if abs(expected - txn["Saldo"]) > 1.0:
-                # Kalau tidak cocok, coba balik Debit/Kreditnya
+                # Jika tidak cocok, coba balik Debit/Kreditnya
                 expected_swap = round(saldo_berjalan + txn["Debit"] - txn["Kredit"], 2)
                 if abs(expected_swap - txn["Saldo"]) <= 1.0:
-                    # Ternyata kebalik, kita tukar!
-                    txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"]
+                    txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"] # TUKAR!
             saldo_berjalan = txn["Saldo"]
 
-    # Tentukan Tipe Asli Bank setelah validasi
     for txn in transactions:
         if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
         elif txn["Kredit"] > 0: txn["Tipe Asli"] = "CR"
@@ -192,7 +186,7 @@ def parse_bca(file_bytes, password=None):
     return transactions
 
 # =========================================================
-# PARSER MAYBANK (Tidak Diubah)
+# PARSER MAYBANK
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_maybank(file_bytes, password=None):
@@ -287,7 +281,7 @@ if uploaded_files:
         final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
 
-        st.subheader("📊 Preview Data (Sudah Divalidasi Matematika)")
+        st.subheader("📊 Preview Data")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
@@ -297,6 +291,6 @@ if uploaded_files:
         st.download_button(
             "📥 Download Excel",
             data=output.getvalue(),
-            file_name="mutasi_bank_fixed_math.xlsx",
+            file_name="mutasi_bank_final.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
