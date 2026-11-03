@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Final Fix)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Absolute Final Fix)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -60,12 +60,11 @@ def parse_bca_perfect(file_obj, password=None):
                 "lines": [m_date.group(2)]
             }
         elif current_block:
-            # Tangkap khusus baris lanjutan seperti BUNGA atau PAJAK BUNGA di akhir bulan
             upper_line = line_str.upper()
             if "BUNGA" in upper_line or "PAJAK BUNGA" in upper_line:
                 raw_blocks.append(current_block)
                 current_block = {
-                    "tgl": current_block["tgl"], # Gunakan tanggal transaksi sebelumnya (akhir bulan)
+                    "tgl": current_block["tgl"],
                     "lines": [line_str]
                 }
             else:
@@ -88,53 +87,47 @@ def parse_bca_perfect(file_obj, password=None):
         nominal = 0.0
         saldo = None
 
-        # 1. BARIS PAJAK BUNGA & BIAYA ADM (Selalu DB)
+        # Cari seluruh angka berformat desimal (.XX) dalam baris
+        all_decimals = re.findall(r"([\d,]+\.\d{2})", combined_text)
+        
+        if not all_decimals:
+            continue
+
+        # 1. BARIS PAJAK BUNGA / BIAYA ADM
         if "PAJAK BUNGA" in upper_text or "BIAYA ADM" in upper_text:
             is_db = True
-            all_nums = re.findall(r"([\d,]+\.\d{2})", combined_text)
             db_match = re.search(r"([\d,]+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
-            
             if db_match:
                 nominal = float(db_match.group(1).replace(',', ''))
-            elif all_nums:
-                nominal = float(all_nums[0].replace(',', ''))
-            
-            if len(all_nums) >= 2:
-                saldo = float(all_nums[-1].replace(',', ''))
             else:
-                saldo = None
-        
-        # 2. BARIS BUNGA (Selalu CR)
+                nominal = float(all_decimals[0].replace(',', ''))
+            
+            if len(all_decimals) >= 2:
+                saldo = float(all_decimals[-1].replace(',', ''))
+
+        # 2. BARIS BUNGA
         elif "BUNGA" in upper_text and "PAJAK" not in upper_text:
             is_db = False
-            all_nums = re.findall(r"([\d,]+\.\d{2})", combined_text)
-            if all_nums:
-                nominal = float(all_nums[0].replace(',', ''))
-            if len(all_nums) >= 2:
-                saldo = float(all_nums[-1].replace(',', ''))
-            else:
-                saldo = None
+            nominal = float(all_decimals[0].replace(',', ''))
+            if len(all_decimals) >= 2:
+                saldo = float(all_decimals[-1].replace(',', ''))
 
         # 3. TRANSAKSI NORMAL BCA
         else:
-            all_nums = re.findall(r"([\d,]+\.\d{2})", combined_text)
-            
-            if len(all_nums) >= 2:
-                nominal = float(all_nums[0].replace(',', ''))
-                saldo = float(all_nums[-1].replace(',', ''))
-                # Validasi agar saldo tidak sama persis dengan mutasi (mencegah duplikat)
-                if nominal == saldo and len(all_nums) == 2:
-                    saldo = None
-            elif len(all_nums) == 1:
-                nominal = float(all_nums[0].replace(',', ''))
+            if len(all_decimals) >= 2:
+                # Angka pertama adalah Mutasi, Angka terakhir adalah Saldo Akhir
+                nominal = float(all_decimals[0].replace(',', ''))
+                saldo = float(all_decimals[-1].replace(',', ''))
+            elif len(all_decimals) == 1:
+                nominal = float(all_decimals[0].replace(',', ''))
                 saldo = None
 
             if "DB" in upper_text:
                 is_db = True
 
-        # Bersihkan deskripsi keterangan
+        # Bersihkan deskripsi keterangan dari angka desimal
         desc = combined_text
-        for num_str in re.findall(r"[\d,]+\.\d{2}", combined_text):
+        for num_str in all_decimals:
             desc = desc.replace(num_str, "")
         
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.IGNORECASE)
@@ -253,7 +246,7 @@ if uploaded_files:
             final_df = final_df.sort_values(by=['Tanggal_DT'], ascending=True).reset_index(drop=True)
             final_df = final_df.drop(columns=['Tanggal_DT'])
 
-            st.subheader("📊 Preview Data (Final Sempurna - Pajak Bunga & Saldo Akurat)")
+            st.subheader("📊 Preview Data (Absolute Correct Saldo & Tax)")
             st.dataframe(final_df, use_container_width=True)
             
             output = BytesIO()
@@ -262,9 +255,9 @@ if uploaded_files:
             processed_data = output.getvalue()
             
             st.download_button(
-                label="📥 Download Excel Fix Total",
+                label="📥 Download Excel Fix Mutasi & Saldo",
                 data=processed_data,
-                file_name="mutasi_bank_final_fixed.xlsx",
+                file_name="mutasi_bank_absolute_correct.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         except Exception as e:
