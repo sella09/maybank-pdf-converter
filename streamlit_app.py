@@ -44,18 +44,17 @@ def to_float(num_str):
 def clean_desc(text):
     if not text: return ""
     t = str(text)
-    # Bersihkan teks footer/header/sampah
+    # Buang sampah-sampah
     t = re.sub(r"Bersambung ke halaman berikut\.?", "", t, flags=re.I)
     t = re.sub(r"SALDO\s+AWAL\s*:.*?(SALDO\s+AKHIR\s*:.*)?", "", t, flags=re.I)
     t = re.sub(r"MUTASI\s*(CR|DB)?\s*:.*?(SALDO\s+AKHIR\s*:.*)?", "", t, flags=re.I)
     t = re.sub(r"CATATAN\s*:.*?Rekening\.?", "", t, flags=re.I | re.S)
     t = re.sub(r"HALAMAN\s*:.*?IDR", "", t, flags=re.I)
-    # Bersihkan format tanggal yang nyangkut
-    t = re.sub(r"\b\d{2}/\d{2}\b", "", t)
+    t = re.sub(r"REKENING GIRO|KCIU RAWAMANGUN|NO. REKENING|PERIODE\s*:|MATA UANG", "", t, flags=re.I)
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (100% BERDASARKAN POSISI X DAN Y)
+# PARSER BCA (BERBASIS TEKS MENTAH)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -84,11 +83,9 @@ def parse_bca(file_bytes, password=None):
             row = sorted(lines[y], key=lambda w: w['x0'])
             row_text = " ".join([w['text'] for w in row])
 
-            # Abaikan baris header/footer
             if any(k in row_text.upper() for k in ["REKENING GIRO", "KCIU RAWAMANGUN", "NO. REKENING", "PERIODE :", "MATA UANG", "CATATAN:", "BCA BERHAK"]):
                 continue
 
-            # Baris transaksi baru diawali tanggal DD/MM
             m_date = re.match(r"^(\d{2}/\d{2})\s+(.+)", row_text)
             
             if m_date:
@@ -97,44 +94,48 @@ def parse_bca(file_bytes, password=None):
 
                 tgl = m_date.group(1)
                 rest_text = m_date.group(2)
-                
-                # Pisahkan teks dan angka berdasarkan koordinat X
-                # Teks BCA: Keterangan (X < 300), Nominal (X 300-400), Saldo (X > 400)
-                desc_parts = []
-                nominal = 0.0
-                saldo = None
-                
-                for w in row:
-                    txt = w['text']
-                    if re.match(r"^\d[\d,]*\.\d{2}$", txt):
-                        # Ini angka
-                        val = to_float(txt)
-                        if w['x0'] < 380:
-                            nominal = val
-                        else:
-                            saldo = val
-                    else:
-                        # Ini teks (abaikan teks tanggal)
-                        if not re.match(r"^\d{2}/\d{2}$", txt):
-                            desc_parts.append(txt)
 
-                desc_text = " ".join(desc_parts)
+                # Pisahkan teks dan angka menggunakan Regex
+                # Angka BCA formatnya selalu pakai koma desimal (misal: 600,000.00 atau 600000.00)
+                nums_raw = re.findall(r"\b\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?\b", rest_text)
+                # Filter hanya yang ada desimal .00
+                nums_raw = [n for n in nums_raw if re.search(r"\.\d{2}$", n)]
                 
-                # Tentukan Debit/Kredit berdasarkan teks DB/CR atau posisi
+                nums = [to_float(n) for n in nums_raw]
+                
+                # Teks murni (hapus angka dan teks DB/CR)
+                desc_text = rest_text
+                for n in nums_raw:
+                    desc_text = desc_text.replace(n, "")
+                
+                upper_desc = desc_text.upper()
+                
+                # LOGIKA DEBIT / KREDIT BCA
+                # 1. Jika aslinya DB (Uang Keluar)
                 is_db = False
-                if any(k in desc_text.upper() for k in ["TRSF E-BANKING DB", "EDDY SUFENDI", "BIAYA", "PAJAK", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA", "BYR VIA"]):
+                if any(k in upper_desc for k in ["TRSF E-BANKING DB", "EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA"]):
                     is_db = True
-                elif "BI-FAST" in desc_text.upper() or "TRSF E-BANKING CR" in desc_text.upper():
-                    is_db = False
+                
+                # Ekstrak Nominal dan Saldo
+                if len(nums) >= 2:
+                    nominal = nums[0]
+                    saldo = nums[-1]
+                elif len(nums) == 1:
+                    nominal = nums[0]
+                    saldo = None
+                else:
+                    nominal = 0.0
+                    saldo = None
 
+                # Tentukan Debit/Kredit
                 debit_val = nominal if is_db else 0.0
                 kredit_val = nominal if not is_db else 0.0
-
-                # Jika teks bilang DB tapi posisinya di kanan (seharusnya CR), kita paksa masuk Debit sesuai teks
-                if "TRSF E-BANKING DB" in desc_text.upper():
-                    debit_val, kredit_val = nominal, 0.0
-                elif "TRSF E-BANKING CR" in desc_text.upper() or "BI-FAST" in desc_text.upper():
-                    debit_val, kredit_val = 0.0, nominal
+                
+                # Khusus SALDO AWAL
+                if "SALDO AWAL" in upper_desc:
+                    debit_val = 0.0
+                    kredit_val = 0.0
+                    saldo = nominal
 
                 current_txn = {
                     "Tanggal": f"{tgl}/{tahun}",
@@ -148,16 +149,11 @@ def parse_bca(file_bytes, password=None):
                 order += 1
 
             else:
-                # Baris lanjutan (nama PT/alamat)
+                # Baris lanjutan keterangan (Nama PT)
                 if current_txn:
-                    # Hanya ambil teks yang bukan angka nominal/saldo
-                    extra_parts = []
-                    for w in row:
-                        txt = w['text']
-                        if not re.match(r"^\d[\d,]*\.\d{2}$", txt) and not re.match(r"^\d{2}/\d{2}$", txt):
-                            extra_parts.append(txt)
-                    if extra_parts:
-                        current_txn["Keterangan"] += " " + " ".join(extra_parts)
+                    # Bersihkan dari angka
+                    extra_text = re.sub(r"\b\d{1,3}(?:[.,]\d{3})*(?:\.\d{2})?\b", "", row_text)
+                    current_txn["Keterangan"] += " " + extra_text
 
         if current_txn:
             transactions.append(current_txn)
@@ -165,14 +161,13 @@ def parse_bca(file_bytes, password=None):
 
     pdf.close()
 
-    # Bersihkan semua deskripsi
+    # Final Cleanup
     for txn in transactions:
         txn["Keterangan"] = clean_desc(txn["Keterangan"])
-        # Hapus kode referensi panjang (misal 1301/FTSCY/WS95051)
+        txn["Keterangan"] = re.sub(r"\bDB\b|\bCR\b", "", txn["Keterangan"]).strip()
+        # Hapus kode referensi panjang (contoh: 1301/FTSCY/WS95051)
         txn["Keterangan"] = re.sub(r"\b\d{4}/[A-Z0-9/]+\b", "", txn["Keterangan"])
         txn["Keterangan"] = " ".join(txn["Keterangan"].split())
-        # Hapus kata DB / CR sisa
-        txn["Keterangan"] = re.sub(r"\bDB\b|\bCR\b", "", txn["Keterangan"]).strip()
 
         if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
         elif txn["Kredit"] > 0: txn["Tipe Asli"] = "CR"
@@ -276,7 +271,7 @@ if uploaded_files:
         final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
 
-        st.subheader("📊 Preview Data (Bersih & Akurat)")
+        st.subheader("📊 Preview Data (Bersih Total)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
@@ -286,6 +281,6 @@ if uploaded_files:
         st.download_button(
             "📥 Download Excel",
             data=output.getvalue(),
-            file_name="mutasi_bank_bersih.xlsx",
+            file_name="mutasi_bank_final_bgt.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
