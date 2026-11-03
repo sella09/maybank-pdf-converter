@@ -5,7 +5,7 @@ import re
 from io import BytesIO
 
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Clean Parser)")
+st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank - Final Precision)")
 
 def parse_bca_perfect(file_obj, password=None):
     transactions = []
@@ -28,7 +28,6 @@ def parse_bca_perfect(file_obj, password=None):
 
     lines = full_text.split('\n')
     
-    # Kata kunci header/footer BCA yang harus diabaikan
     ignore_keywords = [
         "REKENING GIRO", "KCU", "DOMINIC DIGITAL", "KELAPA GADING", "JL BOULEVARD",
         "JAKARTA", "INDONESIA", "NO. REKENING", "HALAMAN", "PERIODE", "MATA UANG",
@@ -41,7 +40,6 @@ def parse_bca_perfect(file_obj, password=None):
         line_str = line.strip()
         if not line_str:
             continue
-        # Abaikan baris nomor halaman atau keyword header/footer
         if re.match(r"^\d+\s*/\s*\d+$", line_str) or (re.match(r"^\d+$", line_str) and len(line_str) <= 3):
             continue
         if any(kw.lower() in line_str.lower() for kw in ignore_keywords):
@@ -69,7 +67,10 @@ def parse_bca_perfect(file_obj, password=None):
 
     for block in raw_blocks:
         combined_text = " ".join(block["lines"])
-        pattern_amount = r"([\d,]+\.\d{2})\s*(DB)?"
+        
+        # PENTING: Hanya ambil angka yang memiliki pemisah koma ribuan yang valid (misal: 1,387,500.00)
+        # agar tidak keliru membaca kode referensi mentah tanpa koma.
+        pattern_amount = r"(\d{1,3}(?:,\d{3})+\.\d{2})\s*(DB)?"
         matches = list(re.finditer(pattern_amount, combined_text, flags=re.IGNORECASE))
         
         if not matches:
@@ -81,14 +82,14 @@ def parse_bca_perfect(file_obj, password=None):
 
         upper_text = combined_text.upper()
         if "PAJAK BUNGA" in upper_text or "BIAYA ADM" in upper_text:
-            db_match = re.search(r"([\d,]+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
+            db_match = re.search(r"(\d{1,3}(?:,\d{3})+\.\d{2})\s+DB", combined_text, flags=re.IGNORECASE)
             if db_match:
                 nominal = float(db_match.group(1).replace(',', ''))
                 is_db = True
             saldo_str = matches[-1].group(1).replace(',', '')
             saldo = float(saldo_str)
         elif "BUNGA" in upper_text:
-            bunga_match = re.search(r"([\d,]+\.\d{2})", combined_text)
+            bunga_match = re.search(r"(\d{1,3}(?:,\d{3})+\.\d{2})", combined_text)
             if bunga_match:
                 nominal = float(bunga_match.group(1).replace(',', ''))
             is_db = False
@@ -218,7 +219,7 @@ if uploaded_files:
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
         
-        # Pengurutan Kronologis dan Pembersihan Tanggal
+        # Pengurutan Kronologis dari Bulan Terkecil (Januari) ke Terbesar
         try:
             final_df['Tanggal'] = final_df['Tanggal'].astype(str).str.strip()
             final_df['Tanggal_DT'] = pd.to_datetime(final_df['Tanggal'], format='%d/%m/%Y', errors='coerce')
@@ -227,7 +228,7 @@ if uploaded_files:
         except Exception as e:
             st.warning(f"Gagal mengurutkan tanggal secara otomatis: {e}")
 
-        st.subheader("📊 Preview Data (Bersih, Urut Kronologis, & Swap)")
+        st.subheader("📊 Preview Data (Presisi, Urut Kronologis, & Swap)")
         st.dataframe(final_df, use_container_width=True)
         
         output = BytesIO()
@@ -236,7 +237,7 @@ if uploaded_files:
         processed_data = output.getvalue()
         
         st.download_button(
-            label="📥 Download Excel Bersih & Urut",
+            label="📥 Download Excel Presisi & Urut",
             data=processed_data,
             file_name="mutasi_bank_swapped.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
