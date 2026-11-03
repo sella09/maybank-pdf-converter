@@ -7,6 +7,9 @@ from io import BytesIO
 st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
 st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank)")
 
+# =========================================================
+# HELPER
+# =========================================================
 def open_pdf(file_obj, password=None):
     file_obj.seek(0)
     try:
@@ -17,7 +20,7 @@ def open_pdf(file_obj, password=None):
         msg = str(e).lower()
         if "password" in msg or "encrypt" in msg or "decrypt" in msg:
             if not password:
-                raise ValueError("PDF terproteksi. Isi kolom 🔑 Password.")
+                raise ValueError("PDF ini terproteksi password. Isi kolom 🔑 Password PDF.")
             raise ValueError("Password PDF salah.")
         raise
 
@@ -35,11 +38,25 @@ def to_float(num_str):
     except ValueError: return None
 
 def clean_desc(text):
+    """Membersihkan teks keterangan dari noise/footer BCA secara agresif."""
     if not text: return ""
     t = str(text)
-    t = re.sub(r"Rekening ini sampai dengan akhir bulan berikutnya.*?Rekening ini\.", "", t, flags=re.IGNORECASE | re.DOTALL)
-    t = re.sub(r"telah menyetujui segala data.*?Rekening ini\.", "", t, flags=re.I | re.S)
-    return " ".join(t.split()).strip()
+    # Hapus kalimat footer BCA yang sering muncul
+    t = re.sub(
+        r"Rekening ini sampai dengan akhir bulan berikutnya.*?Rekening ini\.",
+        "", t, flags=re.IGNORECASE | re.DOTALL
+    )
+    t = re.sub(
+        r"telah menyetujui segala data.*?Rekening ini\.",
+        "", t, flags=re.IGNORECASE | re.DOTALL
+    )
+    t = re.sub(
+        r"Apabila nasabah tidak melakukan sanggahan.*?Laporan Mutasi Rekening\.",
+        "", t, flags=re.IGNORECASE | re.DOTALL
+    )
+    # Hapus spasi berlebih
+    t = " ".join(t.split())
+    return t.strip()
 
 # =========================================================
 # PARSER BCA (HYBRID: TABEL + TEKS FALLBACK)
@@ -102,7 +119,7 @@ def parse_bca_hybrid(file_obj, password=None):
                 desc = row_text
                 for d in decimals: desc = desc.replace(d, "")
                 desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
-                desc = " ".join(desc.split()).strip()
+                desc = clean_desc(desc)
 
                 debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
 
@@ -137,7 +154,6 @@ def parse_bca_hybrid(file_obj, password=None):
         date_pattern = re.compile(r"^(\d{2}/\d{2})\s*(.+)")
 
         for line_str in clean_lines:
-            # Tanggal mungkin menempel dengan teks, misal: 01/07SALDO AWAL
             m_date = date_pattern.match(line_str)
             if m_date:
                 if current_block: raw_blocks.append(current_block)
@@ -160,8 +176,6 @@ def parse_bca_hybrid(file_obj, password=None):
             has_db = bool(re.search(r"\bDB\b", upper_text))
             has_cr = bool(re.search(r"\bCR\b", upper_text))
 
-            # Perbaikan: Tangani format angka yang menempel (misal: 12345.67DB atau 12345.67CR)
-            # Dan pastikan regex membaca angka ribuan dengan benar
             all_decimals = re.findall(r"[\d,]+\.\d{2}", combined_text)
             if not all_decimals: continue
 
@@ -194,14 +208,13 @@ def parse_bca_hybrid(file_obj, password=None):
                 if has_db: is_db = True
                 elif has_cr: is_db = False
                 else:
-                    # Cek keyword DB
                     db_keywords = ["EDDY SUFENDI", "TRANSFER VIA LLG", "AUTODEBET", "PENERIMAAN NEGARA", "BIAYA TRANSFER SME", "BIAYA REFERENSI", "FEE TELEX", "FEE FULL", "FEE VALUE", "TRANSFER OR VIA IB"]
                     if any(k in upper_text for k in db_keywords): is_db = True
 
             desc = combined_text
             for num_str in all_decimals: desc = desc.replace(num_str, "")
             desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.IGNORECASE)
-            desc = " ".join(desc.split()).strip()
+            desc = clean_desc(desc)
 
             debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
 
@@ -215,10 +228,9 @@ def parse_bca_hybrid(file_obj, password=None):
     return transactions
 
 # =========================================================
-# PARSER MAYBANK (Fallback Sederhana)
+# PARSER MAYBANK (Fallback)
 # =========================================================
 def parse_maybank_statement(file_obj, password=None):
-    # Sama seperti sebelumnya...
     transactions = []
     pdf = open_pdf(file_obj, password)
     full_text = "".join([(p.extract_text() or "") + "\n" for p in pdf.pages])
@@ -243,7 +255,7 @@ def parse_maybank_statement(file_obj, password=None):
         desc = re.sub(r"^\d{2}[/-]\d{2}[/-]?\d{0,4}\s*", "", line_str)
         for n in nums: desc = desc.replace(n, "")
         desc = re.sub(r"\bDB\b|\bCR\b", "", desc, flags=re.I)
-        desc = " ".join(desc.split()).strip()
+        desc = clean_desc(desc)
 
         debit_val, kredit_val = (0.0, nominal) if is_db else (nominal, 0.0)
         transactions.append({
@@ -254,19 +266,29 @@ def parse_maybank_statement(file_obj, password=None):
     return transactions
 
 # =========================================================
-# BUILD DF & UI
+# BUILD DF & POST-PROCESSING
 # =========================================================
 def build_df(transactions, sumber_file):
-    return pd.DataFrame([{
+    df = pd.DataFrame([{
         "Sumber File": sumber_file, "Tanggal": t["Tanggal"], "Kode": t["Kode"],
         "Keterangan": t["Keterangan"], "Debit": t["Debit"], "Kredit": t["Kredit"],
         "Saldo": t["Saldo"], "Tipe Asli Bank": t["Tipe Asli"]
     } for t in transactions])
+    
+    # --- PERBAIKAN 1: Isi Saldo yang kosong (forward fill) ---
+    # Karena BCA hanya menampilkan saldo di akhir halaman, kita pakai ffill
+    if not df.empty:
+        df["Saldo"] = df["Saldo"].ffill()
+    
+    return df
 
+# =========================================================
+# UI
+# =========================================================
 col1, col2, col3 = st.columns(3)
 with col1: bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
 with col2: password = st.text_input("🔑 Password PDF (jika ada)", type="password")
-with col3: uploaded_files = st.file_uploader("📄 Pilih file PDF", type=["pdf", "txt"], accept_multiple_files=True)
+with col3: uploaded_files = st.file_uploader("📄 Pilih file PDF/TXT", type=["pdf", "txt"], accept_multiple_files=True)
 
 if uploaded_files:
     all_dfs = []
@@ -297,7 +319,7 @@ if uploaded_files:
         final_df = final_df.sort_values("Tanggal_DT").reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT"])
 
-        st.subheader("📊 Preview Data (Debet ↔ Kredit swapped)")
+        st.subheader("📊 Preview Data (Debet ↔ Kredit swapped, Saldo Filled)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
