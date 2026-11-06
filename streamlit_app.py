@@ -46,7 +46,7 @@ def clean_desc(text):
     return " ".join(str(text).split()).strip()
 
 # =========================================================
-# PARSER MAYBANK (MURNI TEKS BARIS)
+# PARSER MAYBANK (MUTLAK PAKAI GARIS TABEL)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_maybank(file_bytes, password=None):
@@ -56,88 +56,93 @@ def parse_maybank(file_bytes, password=None):
     order = 0
 
     for page in pdf.pages:
-        text = page.extract_text(layout=True)
-        if not text: continue
+        # Strategi: potong HANYA berdasarkan garis horizontal (baris tabel)
+        # Lalu untuk kolom, potong berdasarkan "text" (karena Maybank tidak punya garis vertikal penuh)
+        tables = page.extract_tables({
+            "vertical_strategy": "text", 
+            "horizontal_strategy": "lines"
+        })
+        
+        for table in tables:
+            for row in table:
+                if not row or len(row) < 5: continue
+                
+                # Bersihkan sel dari nilai None/newline
+                cells = [str(c).replace("\n", " ").strip() if c else "" for c in row]
+                
+                # Gabungkan baris ini untuk mencari Tanggal
+                full_row = " ".join(cells)
+                m_date = re.search(r"(\d{2}/\d{2}/\d{4})", full_row)
+                if not m_date: continue
 
-        lines = text.split("\n")
-        for line in lines:
-            line_str = line.strip()
-            if not line_str: continue
+                tgl = m_date.group(1)
+                
+                # Cari Kode (4 digit di sebelah kiri)
+                kode = "-"
+                for c in cells:
+                    if re.match(r"^\d{4}$", c):
+                        kode = c
+                        break
+                
+                # Cari semua angka nominal (Debit, Kredit, Saldo)
+                nums = []
+                for c in cells:
+                    # Cari format angka (1.000.000,00 atau 1000000.00)
+                    found = re.findall(r"\b\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\b", c)
+                    for f in found:
+                        nums.append(to_float(f))
+                
+                debit_val = 0.0
+                kredit_val = 0.0
+                saldo = None
 
-            # Abaikan header
-            if any(k in line_str.upper() for k in ["TGL KODE KETERANGAN", "TRANSAKSI REKENING GIRO"]):
-                continue
+                # LOGIKA 3 ANGKA DARI KANAN
+                if len(nums) >= 3:
+                    saldo = nums[-1]
+                    kredit_val = nums[-2]
+                    debit_val = nums[-3]
+                elif len(nums) == 2:
+                    saldo = nums[-1]
+                    # Cek validasi saldo sebelumnya
+                    if len(transactions) > 0 and transactions[-1]["Saldo"] is not None:
+                        prev = transactions[-1]["Saldo"]
+                        if round(prev - nums[-2], 2) == round(saldo, 2):
+                            debit_val = nums[-2]
+                        else:
+                            kredit_val = nums[-2]
+                elif len(nums) == 1:
+                    saldo = nums[-1]
 
-            # Cek apakah baris ini berisi tanggal (format 01/09/2026)
-            m_date = re.search(r"(\d{2}/\d{2}/\d{4})", line_str)
-            if not m_date: continue
+                # Bersihkan Keterangan (Hapus Tanggal, Kode, Angka)
+                desc_text = full_row
+                desc_text = desc_text.replace(tgl, "")
+                if kode != "-": desc_text = desc_text.replace(kode, "")
+                for n in nums: desc_text = desc_text.replace(str(n), "")
+                desc_text = re.sub(r"\bDEBIT\b|\bKREDIT\b|\bSALDO\b", "", desc_text, flags=re.I)
 
-            tgl = m_date.group(1)
-            
-            # Hapus tanggal dari baris untuk mencari angka
-            clean_line = line_str.replace(tgl, "")
+                # Validasi Pembalik (Paksa Bener)
+                if saldo is not None and len(transactions) > 0:
+                    prev_saldo = transactions[-1]["Saldo"]
+                    if prev_saldo is not None:
+                        if round(prev_saldo - debit_val, 2) == round(saldo, 2):
+                            kredit_val = 0.0
+                        elif round(prev_saldo + kredit_val, 2) == round(saldo, 2):
+                            debit_val = 0.0
+                        else:
+                            diff = round(prev_saldo - saldo, 2)
+                            if diff > 0: debit_val = diff
+                            else: kredit_val = abs(diff)
 
-            # Cari Kode (4 digit angka di awal baris)
-            m_kode = re.match(r"^\s*(\d{4})\s+", clean_line)
-            kode = m_kode.group(1) if m_kode else "-"
-            if m_kode:
-                clean_line = clean_line.replace(kode, "")
-
-            # Ekstrak HANYA angka desimal (contoh: 150.000.000,00 atau 150,000,000.00)
-            # Pola: minimal ada titik atau koma diikuti 2 digit di belakang
-            nums_raw = re.findall(r"\b\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\b", clean_line)
-            nums = [to_float(n) for n in nums_raw]
-
-            debit_val = 0.0
-            kredit_val = 0.0
-            saldo = None
-
-            # LOGIKA BACA DARI KANAN
-            if len(nums) >= 3:
-                saldo = nums[-1]
-                kredit_val = nums[-2]
-                debit_val = nums[-3]
-            elif len(nums) == 2:
-                saldo = nums[-1]
-                # Cek apakah selisihnya cocok untuk Debit atau Kredit
-                if len(transactions) > 0 and transactions[-1]["Saldo"] is not None:
-                    prev = transactions[-1]["Saldo"]
-                    if round(prev - nums[-2], 2) == round(saldo, 2):
-                        debit_val = nums[-2]
-                    else:
-                        kredit_val = nums[-2]
-            elif len(nums) == 1:
-                saldo = nums[0]
-
-            # Keterangan: Hapus angka dari baris
-            desc_text = clean_line
-            for n in nums_raw:
-                desc_text = desc_text.replace(n, "")
-            desc_text = re.sub(r"\bDEBIT\b|\bKREDIT\b|\bSALDO\b", "", desc_text, flags=re.I)
-            
-            # Validasi Akhir
-            if saldo is not None and len(transactions) > 0:
-                prev_saldo = transactions[-1]["Saldo"]
-                if prev_saldo is not None:
-                    if round(prev_saldo - debit_val, 2) == round(saldo, 2):
-                        kredit_val = 0.0
-                    elif round(prev_saldo + kredit_val, 2) == round(saldo, 2):
-                        debit_val = 0.0
-                    else:
-                        diff = round(prev_saldo - saldo, 2)
-                        if diff > 0: debit_val = diff
-                        else: kredit_val = abs(diff)
-
-            transactions.append({
-                "Tanggal": tgl,
-                "Kode": kode,
-                "Keterangan": clean_desc(desc_text),
-                "Debit": debit_val,
-                "Kredit": kredit_val,
-                "Saldo": saldo,
-                "_order": order,
-            })
-            order += 1
+                transactions.append({
+                    "Tanggal": tgl,
+                    "Kode": kode,
+                    "Keterangan": clean_desc(desc_text),
+                    "Debit": debit_val,
+                    "Kredit": kredit_val,
+                    "Saldo": saldo,
+                    "_order": order,
+                })
+                order += 1
 
     pdf.close()
 
@@ -300,7 +305,7 @@ if uploaded_files:
         final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
 
-        st.subheader("📊 Preview Data (Bersih & Akurat)")
+        st.subheader("📊 Preview Data (Bersih Total)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
@@ -310,6 +315,6 @@ if uploaded_files:
         st.download_button(
             "📥 Download Excel",
             data=output.getvalue(),
-            file_name="mutasi_bank_final_fixed.xlsx",
+            file_name="mutasi_bank_fixed.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
