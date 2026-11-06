@@ -1,308 +1,142 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
+import io
 import re
-import traceback
-from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import dataframe_to_rows
 
-# =========================================================
-# KONFIGURASI HALAMAN
-# =========================================================
-st.set_page_config(page_title="Bank PDF to Excel Converter", layout="wide")
-st.title("🏦 Bank PDF → Excel Converter (BCA & Maybank)")
+st.set_page_config(page_title="Maybank RK PDF to Excel Converter", page_icon="📊", layout="wide")
 
-# =========================================================
-# HELPER FUNCTIONS
-# =========================================================
-def open_pdf(file_obj, password=None):
-    file_obj.seek(0)
+st.title("📊 Converter Rekening Koran Maybank PDF ke Excel")
+st.write("Aplikasi ini membantu mengekstrak data Rekening Koran Maybank (termasuk PDF ber-password) dan mengonversinya ke format Excel (.xlsx).")
+
+# Widget input file dan password
+uploaded_files = st.file_uploader("Unggah File PDF Rekening Koran Maybank", type=["pdf"], accept_multiple_files=True)
+pdf_password = st.text_input("Masukkan Password PDF (Kosongkan jika tidak ada)", type="password")
+
+def clean_number(val_str):
+    if not val_str:
+        return 0.0
+    val = val_str.replace(".", "").replace(",", ".").strip()
     try:
-        if password:
-            return pdfplumber.open(file_obj, password=password)
-        return pdfplumber.open(file_obj)
+        return float(val)
+    except ValueError:
+        return 0.0
+
+def process_pdf(pdf_file, password):
+    all_rows = []
+    try:
+        # Membuka PDF dengan password jika ada
+        with pdfplumber.open(pdf_file, password=password if password else None) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in tables:
+                    for row in table:
+                        row_cleaned = [str(c).replace('\n', ' ').strip() if c is not None else '' for c in row]
+                        row_str = " ".join(row_cleaned).upper()
+                        
+                        # Lewati baris header tabel
+                        if "TRANSAKSI REKENING GIRO" in row_str or ("TGL" in row_str and "KETERANGAN" in row_str):
+                            continue
+                        
+                        if len(row_cleaned) >= 6:
+                            tgl, kode, ket, debit, kredit, saldo = row_cleaned[:6]
+                            
+                            # Deteksi format tanggal DD/MM/YYYY
+                            if re.match(r'^\d{2}/\d{2}/\d{4}$', tgl):
+                                float_debit = clean_number(debit)
+                                float_kredit = clean_number(kredit)
+                                float_saldo = clean_number(saldo)
+                                
+                                all_rows.append({
+                                    "TGL": tgl,
+                                    "KODE": kode,
+                                    "KETERANGAN": ket,
+                                    "DEBIT": float_debit if float_debit != 0 else None,
+                                    "KREDIT": float_kredit if float_kredit != 0 else None,
+                                    "SALDO": float_saldo
+                                })
+                            elif all_rows and ket:
+                                # Baris lanjutan keterangan transaksi
+                                all_rows[-1]["KETERANGAN"] += " " + ket
     except Exception as e:
-        msg = str(e).lower()
-        if "password" in msg or "encrypt" in msg or "decrypt" in msg:
-            if not password:
-                raise ValueError("PDF terproteksi password. Isi kolom 🔑 Password PDF.")
-            raise ValueError("Password PDF salah.")
-        raise
+        st.error(f"Gagal memproses file {pdf_file.name}: {str(e)}")
+        return None
+        
+    return pd.DataFrame(all_rows)
 
-def to_float(num_str):
-    if num_str is None or pd.isna(num_str): return 0.0
-    s = str(num_str).strip()
-    if not s or s in ("-", ""): return 0.0
-    s = re.sub(r"[^\d.,]", "", s)
-    if not s: return 0.0
-    if re.search(r",\d{2}$", s) and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        s = s.replace(",", "")
-    try: return float(s)
-    except ValueError: return 0.0
-
-def clean_desc(text):
-    if not text: return ""
-    return " ".join(str(text).split()).strip()
-
-# =========================================================
-# PARSER MAYBANK (BERDASARKAN KOORDINAT KARAKTER X)
-# =========================================================
-@st.cache_data(show_spinner=False)
-def parse_maybank(file_bytes, password=None):
-    file_obj = BytesIO(file_bytes)
-    pdf = open_pdf(file_obj, password)
-    transactions = []
-    order = 0
-
-    for page in pdf.pages:
-        chars = page.chars
-        if not chars: continue
-
-        # Kelompokkan karakter berdasarkan baris (Y)
-        lines = {}
-        for c in chars:
-            y = round(c['top'], 1)
-            if y not in lines: lines[y] = []
-            lines[y].append(c)
-
-        for y in sorted(lines.keys()):
-            row_chars = sorted(lines[y], key=lambda c: c['x0'])
-            if not row_chars: continue
-
-            # Gabungkan semua teks di baris ini
-            full_text = "".join([c['text'] for c in row_chars])
+def create_excel(df_dict):
+    output = io.BytesIO()
+    wb = Workbook()
+    wb.remove(wb.active)
+    
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    data_font = Font(name="Calibri", size=10)
+    thin_border = Border(
+        left=Side(style='thin', color='D9D9D9'),
+        right=Side(style='thin', color='D9D9D9'),
+        top=Side(style='thin', color='D9D9D9'),
+        bottom=Side(style='thin', color='D9D9D9')
+    )
+    
+    for sheet_name, df in df_dict.items():
+        ws = wb.create_sheet(title=sheet_name[:31])
+        headers = list(df.columns)
+        ws.append(headers)
+        
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
             
-            # Cari tanggal
-            m_date = re.search(r"(\d{2}/\d{2}/\d{4})", full_text)
-            if not m_date: continue
-
-            tgl = m_date.group(1)
+        for row in dataframe_to_rows(df, index=False, header=False):
+            ws.append(row)
             
-            # Ekstrak kata (words) untuk dipisah berdasarkan X
-            words = page.extract_words()
-            row_words = [w for w in words if round(w['top'], 1) == y]
-
-            kode = "-"
-            desc_parts = []
-            debit_val = 0.0
-            kredit_val = 0.0
-            saldo = None
-
-            for w in sorted(row_words, key=lambda w: w['x0']):
-                txt = w['text']
-                x = w['x0']
-
-                if re.search(r"\d{2}/\d{2}/\d{4}", txt): continue # skip tanggal
-                
-                # Kode (4 digit)
-                if 50 < x < 110 and re.match(r"^\d{4}$", txt):
-                    kode = txt
-                # Angka Nominal & Saldo (X > 250)
-                elif re.match(r"^[\d,.]+$", txt) and x > 250:
-                    val = to_float(txt)
-                    if x < 350: debit_val = val
-                    elif x < 450: kredit_val = val
-                    else: saldo = val
-                # Keterangan (X < 250)
-                elif x < 250:
-                    desc_parts.append(txt)
-
-            # Validasi Saldo (Paksa Pembalik jika selisih)
-            if saldo is not None and len(transactions) > 0:
-                prev_saldo = transactions[-1]["Saldo"]
-                if prev_saldo is not None:
-                    if round(prev_saldo - debit_val, 2) == round(saldo, 2):
-                        kredit_val = 0.0
-                    elif round(prev_saldo + kredit_val, 2) == round(saldo, 2):
-                        debit_val = 0.0
-                    else:
-                        diff = round(prev_saldo - saldo, 2)
-                        if diff > 0: debit_val = diff
-                        else: kredit_val = abs(diff)
-
-            transactions.append({
-                "Tanggal": tgl,
-                "Kode": kode,
-                "Keterangan": clean_desc(" ".join(desc_parts)),
-                "Debit": debit_val,
-                "Kredit": kredit_val,
-                "Saldo": saldo,
-                "_order": order,
-            })
-            order += 1
-
-    pdf.close()
-
-    for txn in transactions:
-        if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
-        elif txn["Kredit"] > 0: txn["Tipe Asli"] = "CR"
-        else: txn["Tipe Asli"] = "-"
-
-    return transactions
-
-# =========================================================
-# PARSER BCA (TETAP SAMA)
-# =========================================================
-@st.cache_data(show_spinner=False)
-def parse_bca(file_bytes, password=None):
-    file_obj = BytesIO(file_bytes)
-    pdf = open_pdf(file_obj, password)
-    transactions = []
-    tahun = "2026"
-    order = 0
-    for page in pdf.pages:
-        if page.page_number == 1:
-            text = page.extract_text() or ""
-            m = re.search(r"PERIODE\s*:\s*[A-Za-z]+\s+(\d{4})", text, re.IGNORECASE)
-            if m: tahun = m.group(1)
-        layout_text = page.extract_text(layout=True)
-        if not layout_text: continue
-        lines = layout_text.split("\n")
-        current_txn = None
-        for line in lines:
-            line_str = line.strip()
-            if not line_str: continue
-            if any(k in line_str.upper() for k in ["REKENING GIRO", "KCIU RAWAMANGUN", "NO. REKENING", "PERIODE :", "MATA UANG", "CATATAN:", "BCA BERHAK"]):
-                continue
-            m_date = re.match(r"^(\d{2}/\d{2})\s+(.+)", line_str)
-            if m_date:
-                if current_txn:
-                    current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
-                    transactions.append(current_txn)
-                tgl = m_date.group(1)
-                rest_text = m_date.group(2)
-                parts = rest_text.split()
-                desc_words = []
-                nums = []
-                for p in parts:
-                    if re.match(r"^\d[\d,]*\.\d{2}$", p):
-                        nums.append(to_float(p))
-                    else:
-                        desc_words.append(p)
-                desc_text = " ".join(desc_words)
-                upper_desc = desc_text.upper()
-                is_db = False
-                if any(k in upper_desc for k in ["EDDY SUFENDI", "BIAYA ADM", "PAJAK BUNGA", "PENERIMAAN NEGARA", "BA JASA", "AUTODEBET", "ND-LAINNYA"]):
-                    is_db = True
-                elif "TRSF E-BANKING DB" in upper_desc or "SWITCHING DB" in upper_desc:
-                    is_db = True
-                if len(nums) >= 2:
-                    nominal = nums[0]
-                    saldo = nums[-1]
-                elif len(nums) == 1:
-                    nominal = nums[0]
-                    saldo = None
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            for cell in row:
+                cell.font = data_font
+                cell.border = thin_border
+                col_name = headers[cell.column - 1]
+                if col_name in ["DEBIT", "KREDIT", "SALDO"]:
+                    cell.number_format = '#,##0.00'
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                elif col_name in ["TGL", "KODE"]:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
                 else:
-                    nominal = 0.0
-                    saldo = None
-                debit_val = nominal if is_db else 0.0
-                kredit_val = nominal if not is_db else 0.0
-                if "BUNGA" in upper_desc and "PAJAK" not in upper_desc:
-                    debit_val, kredit_val = 0.0, nominal
-                current_txn = {
-                    "Tanggal": f"{tgl}/{tahun}", "Kode": "-", "Keterangan": desc_text,
-                    "Debit": debit_val, "Kredit": kredit_val, "Saldo": saldo, "_order": order,
-                }
-                order += 1
-            else:
-                if current_txn:
-                    extra_parts = line_str.split()
-                    for p in extra_parts:
-                        if re.match(r"^\d[\d,]*\.\d{2}$", p):
-                            val = to_float(p)
-                            if current_txn["Saldo"] is None and current_txn["Debit"] == 0 and current_txn["Kredit"] == 0:
-                                current_txn["Saldo"] = val
-                            elif current_txn["Debit"] == 0 and current_txn["Kredit"] == 0:
-                                current_txn["Debit"] = val
-                        else:
-                            current_txn["Keterangan"] += " " + p
-        if current_txn:
-            current_txn["Keterangan"] = clean_desc(current_txn["Keterangan"])
-            transactions.append(current_txn)
-            current_txn = None
-    pdf.close()
-    saldo_berjalan = 0.0
-    for txn in transactions:
-        if txn["Saldo"] is None:
-            txn["Saldo"] = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
-        else:
-            if saldo_berjalan != 0.0:
-                expected = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
-                if abs(expected - txn["Saldo"]) > 1.0:
-                    expected_swap = round(saldo_berjalan + txn["Debit"] - txn["Kredit"], 2)
-                    if abs(expected_swap - txn["Saldo"]) <= 1.0:
-                        txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"]
-        saldo_berjalan = txn["Saldo"]
-        txn["Keterangan"] = re.sub(r"\bDB\b|\bCR\b", "", txn["Keterangan"]).strip()
-        txn["Keterangan"] = re.sub(r"\b\d{4}/[A-Z0-9/]+\b", "", txn["Keterangan"]).strip()
-        txn["Keterangan"] = " ".join(txn["Keterangan"].split())
-        if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
-        elif txn["Kredit"] > 0: txn["Tipe Asli"] = "CR"
-        else: txn["Tipe Asli"] = "-"
-    return transactions
-
-# =========================================================
-# UI STREAMLIT
-# =========================================================
-col1, col2, col3 = st.columns(3)
-with col1:
-    bank_choice = st.selectbox("Pilih Bank", ["BCA", "Maybank"])
-with col2:
-    password = st.text_input("🔑 Password PDF (jika ada)", type="password")
-with col3:
-    uploaded_files = st.file_uploader("📄 Pilih file PDF/TXT", type=["pdf", "txt"], accept_multiple_files=True)
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                    
+        for col in ws.columns:
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            col_letter = col[0].column_letter
+            ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+            
+    wb.save(output)
+    return output.getvalue()
 
 if uploaded_files:
-    all_dfs = []
-
-    for uploaded_file in uploaded_files:
-        try:
-            st.info(f"Memproses **{uploaded_file.name}**...")
-            file_bytes = uploaded_file.read()
-
-            if bank_choice == "BCA":
-                txns = parse_bca(file_bytes, password=password)
-            else:
-                txns = parse_maybank(file_bytes, password=password)
-
-            df = pd.DataFrame([{
-                "Sumber File": uploaded_file.name, "Tanggal": t["Tanggal"], "Kode": t["Kode"],
-                "Keterangan": t["Keterangan"], "Debit": t["Debit"], "Kredit": t["Kredit"],
-                "Saldo": t["Saldo"], "Tipe Asli Bank": t.get("Tipe Asli", "-"),
-                "_order": t.get("_order", 0),
-            } for t in txns])
-
-            if not df.empty:
-                all_dfs.append(df)
-                st.success(f"✅ {uploaded_file.name}: {len(df)} transaksi.")
-            else:
-                st.warning(f"⚠️ {uploaded_file.name}: Tidak ada transaksi.")
-
-        except ValueError as ve:
-            st.error(f"🔒 {uploaded_file.name}: {ve}")
-        except Exception as e:
-            st.error(f"❌ Gagal memproses {uploaded_file.name}: {str(e)}")
-            with st.expander("Detail Error"):
-                st.code(traceback.format_exc())
-
-    if all_dfs:
-        final_df = pd.concat(all_dfs, ignore_index=True)
-        final_df["Tanggal"] = final_df["Tanggal"].astype(str).str.strip()
-        final_df["Tanggal_DT"] = pd.to_datetime(final_df["Tanggal"], format="%d/%m/%Y", errors="coerce")
-        final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
-        final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
-
-        st.subheader("📊 Preview Data (Bersih Total)")
-        st.dataframe(final_df, use_container_width=True)
-
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            final_df.to_excel(writer, index=False, sheet_name="Mutasi")
-
-        st.download_button(
-            "📥 Download Excel",
-            data=output.getvalue(),
-            file_name="mutasi_bank_fixed.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    if st.button("🚀 Konversi Ke Excel", type="primary"):
+        processed_data = {}
+        for pdf_file in uploaded_files:
+            df = process_pdf(pdf_file, pdf_password)
+            if df is not None and not df.empty:
+                sheet_title = pdf_file.name.replace(".pdf", "")
+                processed_data[sheet_title] = df
+        
+        if processed_data:
+            st.success("✅ Konversi Berhasil!")
+            excel_bytes = create_excel(processed_data)
+            
+            st.download_button(
+                label="📥 Download File Excel",
+                data=excel_bytes,
+                file_name="Rekening_Koran_Maybank.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+            for name, df in processed_data.items():
+                st.subheader(f"Preview Data: {name}")
+                st.dataframe(df.style.format({"DEBIT": "{:,.2f}", "KREDIT": "{:,.2f}", "SALDO": "{:,.2f}"}))
