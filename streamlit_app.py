@@ -1,5 +1,6 @@
 import streamlit as st
 import pdfplumber
+import pypdf
 import pandas as pd
 import re
 import traceback
@@ -46,105 +47,74 @@ def clean_desc(text):
     return " ".join(str(text).split()).strip()
 
 # =========================================================
-# PARSER MAYBANK (MUTLAK PAKAI GARIS TABEL)
+# PARSER MAYBANK (MENGGUNAKAN Pypdf)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_maybank(file_bytes, password=None):
     file_obj = BytesIO(file_bytes)
-    pdf = open_pdf(file_obj, password)
+    reader = pypdf.PdfReader(file_obj)
+    if password and reader.is_encrypted:
+        reader.decrypt(password)
+
     transactions = []
     order = 0
 
-    for page in pdf.pages:
-        # Strategi: potong HANYA berdasarkan garis horizontal (baris tabel)
-        # Lalu untuk kolom, potong berdasarkan "text" (karena Maybank tidak punya garis vertikal penuh)
-        tables = page.extract_tables({
-            "vertical_strategy": "text", 
-            "horizontal_strategy": "lines"
-        })
-        
-        for table in tables:
-            for row in table:
-                if not row or len(row) < 5: continue
-                
-                # Bersihkan sel dari nilai None/newline
-                cells = [str(c).replace("\n", " ").strip() if c else "" for c in row]
-                
-                # Gabungkan baris ini untuk mencari Tanggal
-                full_row = " ".join(cells)
-                m_date = re.search(r"(\d{2}/\d{2}/\d{4})", full_row)
-                if not m_date: continue
+    for page in reader.pages:
+        text = page.extract_text()
+        if not text: continue
 
-                tgl = m_date.group(1)
-                
-                # Cari Kode (4 digit di sebelah kiri)
-                kode = "-"
-                for c in cells:
-                    if re.match(r"^\d{4}$", c):
-                        kode = c
-                        break
-                
-                # Cari semua angka nominal (Debit, Kredit, Saldo)
-                nums = []
-                for c in cells:
-                    # Cari format angka (1.000.000,00 atau 1000000.00)
-                    found = re.findall(r"\b\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\b", c)
-                    for f in found:
-                        nums.append(to_float(f))
-                
-                debit_val = 0.0
-                kredit_val = 0.0
-                saldo = None
+        lines = text.split("\n")
+        for line in lines:
+            line_str = line.strip()
+            if not line_str: continue
+            
+            # Cari baris yang diawali tanggal (format DD/MM/YYYY)
+            m_date = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(\d{4})\s+(.+)", line_str)
+            if not m_date: continue
 
-                # LOGIKA 3 ANGKA DARI KANAN
-                if len(nums) >= 3:
-                    saldo = nums[-1]
-                    kredit_val = nums[-2]
-                    debit_val = nums[-3]
-                elif len(nums) == 2:
-                    saldo = nums[-1]
-                    # Cek validasi saldo sebelumnya
-                    if len(transactions) > 0 and transactions[-1]["Saldo"] is not None:
-                        prev = transactions[-1]["Saldo"]
-                        if round(prev - nums[-2], 2) == round(saldo, 2):
-                            debit_val = nums[-2]
-                        else:
-                            kredit_val = nums[-2]
-                elif len(nums) == 1:
-                    saldo = nums[-1]
+            tgl = m_date.group(1)
+            kode = m_date.group(2)
+            rest = m_date.group(3)
 
-                # Bersihkan Keterangan (Hapus Tanggal, Kode, Angka)
-                desc_text = full_row
-                desc_text = desc_text.replace(tgl, "")
-                if kode != "-": desc_text = desc_text.replace(kode, "")
-                for n in nums: desc_text = desc_text.replace(str(n), "")
-                desc_text = re.sub(r"\bDEBIT\b|\bKREDIT\b|\bSALDO\b", "", desc_text, flags=re.I)
+            # Ekstrak angka (format: 150.000.000,00)
+            nums_raw = re.findall(r"\b\d{1,3}(?:\.\d{3})*,\d{2}\b", rest)
+            nums = [to_float(n) for n in nums_raw]
 
-                # Validasi Pembalik (Paksa Bener)
-                if saldo is not None and len(transactions) > 0:
-                    prev_saldo = transactions[-1]["Saldo"]
-                    if prev_saldo is not None:
-                        if round(prev_saldo - debit_val, 2) == round(saldo, 2):
-                            kredit_val = 0.0
-                        elif round(prev_saldo + kredit_val, 2) == round(saldo, 2):
-                            debit_val = 0.0
-                        else:
-                            diff = round(prev_saldo - saldo, 2)
-                            if diff > 0: debit_val = diff
-                            else: kredit_val = abs(diff)
+            debit_val = 0.0
+            kredit_val = 0.0
+            saldo = None
 
-                transactions.append({
-                    "Tanggal": tgl,
-                    "Kode": kode,
-                    "Keterangan": clean_desc(desc_text),
-                    "Debit": debit_val,
-                    "Kredit": kredit_val,
-                    "Saldo": saldo,
-                    "_order": order,
-                })
-                order += 1
+            # LOGIKA 3 ANGKA DARI KANAN
+            if len(nums) >= 3:
+                saldo = nums[-1]
+                kredit_val = nums[-2]
+                debit_val = nums[-3]
+            elif len(nums) == 2:
+                saldo = nums[-1]
+                if len(transactions) > 0 and transactions[-1]["Saldo"] is not None:
+                    prev = transactions[-1]["Saldo"]
+                    if round(prev - nums[-2], 2) == round(saldo, 2):
+                        debit_val = nums[-2]
+                    else:
+                        kredit_val = nums[-2]
+            elif len(nums) == 1:
+                saldo = nums[0]
 
-    pdf.close()
+            # Bersihkan Keterangan
+            desc_text = rest
+            for n in nums_raw:
+                desc_text = desc_text.replace(n, "")
+            
+            transactions.append({
+                "Tanggal": tgl,
+                "Kode": kode,
+                "Keterangan": clean_desc(desc_text),
+                "Debit": debit_val,
+                "Kredit": kredit_val,
+                "Saldo": saldo,
+                "_order": order,
+            })
+            order += 1
 
     for txn in transactions:
         if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
