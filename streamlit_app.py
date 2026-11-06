@@ -43,11 +43,10 @@ def to_float(num_str):
 
 def clean_desc(text):
     if not text: return ""
-    t = str(text)
-    return " ".join(t.split()).strip()
+    return " ".join(str(text).split()).strip()
 
 # =========================================================
-# PARSER MAYBANK (100% TABEL GRID)
+# PARSER MAYBANK (BACA BERDASARKAN KOORDINAT X)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_maybank(file_bytes, password=None):
@@ -57,95 +56,92 @@ def parse_maybank(file_bytes, password=None):
     order = 0
 
     for page in pdf.pages:
-        # Ekstrak tabel dengan garis
-        tables = page.extract_tables({
-            "vertical_strategy": "lines", 
-            "horizontal_strategy": "lines"
-        })
+        words = page.extract_words()
         
-        for table in tables:
-            for row in table:
-                if not row or len(row) < 5: 
-                    continue
-                
-                # Cari kolom tanggal (format 01/09/2026)
-                tgl_match = None
-                for cell in row:
-                    if cell and re.match(r"^\d{2}/\d{2}/\d{4}$", str(cell).strip()):
-                        tgl_match = str(cell).strip()
-                        break
-                
-                if not tgl_match: 
-                    continue
+        # Kelompokkan per baris (Y)
+        lines = {}
+        for w in words:
+            y = round(w['top'], 1)
+            if y not in lines: lines[y] = []
+            lines[y].append(w)
 
-                # Inisialisasi nilai
-                kode = "-"
-                keterangan = ""
-                debit_val = 0.0
-                kredit_val = 0.0
-                saldo = None
+        for y in sorted(lines.keys()):
+            row = sorted(lines[y], key=lambda w: w['x0'])
+            row_text = " ".join([w['text'] for w in row])
 
-                # Pemetaan kolom berdasarkan urutan sel di PDF Maybank
-                # Format PDF: [TGL, KODE, KETERANGAN, DEBIT, KREDIT, SALDO]
-                # Kita abaikan sel pertama (TGL) dan sel terakhir (SALDO) dulu
-                cells = [str(c).strip() if c else "" for c in row]
-                
-                # Ambil kode (kolom ke-2)
-                if len(cells) > 1: kode = cells[1]
-                
-                # Ambil keterangan (kolom ke-3, atau gabungan)
-                # Kadang keterangan pecah jadi 2 sel di PDF
-                desc_parts = []
-                for c in cells[2:4]:
-                    if c and not re.match(r"^\d[\d,.]*$", c): # Jika bukan angka murni
-                        desc_parts.append(c)
-                keterangan = " ".join(desc_parts)
+            # Abaikan header
+            if "TGL KODE KETERANGAN" in row_text.upper() or "TRANSAKSI REKENING GIRO" in row_text.upper():
+                continue
 
-                # Cari angka (Debit, Kredit, Saldo) dari seluruh sel di kanan
-                nums = []
-                for c in cells[3:]: # Mulai dari kolom ke-4 (Debit)
-                    if re.match(r"^\d[\d,.]*$", c):
-                        nums.append(to_float(c))
-                
-                if len(nums) >= 3:
-                    debit_val = nums[0]
-                    kredit_val = nums[1]
-                    saldo = nums[2]
-                elif len(nums) == 2:
-                    debit_val = nums[0]
-                    kredit_val = nums[1]
-                    saldo = None
-                elif len(nums) == 1:
-                    # Jika cuma 1 angka, cek posisinya di teks aslinya
-                    pass
+            # Cek apakah baris ini tanggal
+            m_date = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(.+)", row_text)
+            if not m_date: continue
 
-                transactions.append({
-                    "Tanggal": tgl_match,
-                    "Kode": kode,
-                    "Keterangan": clean_desc(keterangan),
-                    "Debit": debit_val,
-                    "Kredit": kredit_val,
-                    "Saldo": saldo,
-                    "_order": order,
-                })
-                order += 1
+            tgl = m_date.group(1)
+            
+            # Inisialisasi
+            kode = "-"
+            desc_parts = []
+            debit_val = 0.0
+            kredit_val = 0.0
+            saldo = None
+
+            # Iterasi setiap kata di baris ini berdasarkan posisi X
+            for w in row:
+                txt = w['text']
+                x = w['x0']
+                
+                if re.match(r"^\d{2}/\d{2}/\d{4}$", txt): 
+                    continue # skip tanggal
+                
+                # Deteksi Kode (X sekitar 60 - 100)
+                if 50 < x < 100 and re.match(r"^\d{4}$", txt):
+                    kode = txt
+                # Deteksi Angka (X > 300)
+                elif re.match(r"^\d[\d,.]*$", txt) and x > 300:
+                    val = to_float(txt)
+                    # Jika ada 3 angka, yang kiri Debit, tengah Kredit, kanan Saldo
+                    if x < 450:
+                        debit_val = val
+                    elif x < 550:
+                        kredit_val = val
+                    else:
+                        saldo = val
+                # Deteksi Keterangan (X < 300)
+                elif x < 300:
+                    desc_parts.append(txt)
+
+            desc_text = " ".join(desc_parts)
+            
+            # Validasi Saldo (Paksa Pembalik jika selisih)
+            if saldo is not None and len(transactions) > 0:
+                prev_saldo = transactions[-1]["Saldo"]
+                if prev_saldo is not None:
+                    if round(prev_saldo - debit_val, 2) == round(saldo, 2):
+                        kredit_val = 0.0
+                    elif round(prev_saldo + kredit_val, 2) == round(saldo, 2):
+                        debit_val = 0.0
+                    else:
+                        # Coba tebak dari total selisih
+                        diff = round(prev_saldo - saldo, 2)
+                        if diff > 0: debit_val = diff
+                        else: kredit_val = abs(diff)
+
+            transactions.append({
+                "Tanggal": tgl,
+                "Kode": kode,
+                "Keterangan": clean_desc(desc_text),
+                "Debit": debit_val,
+                "Kredit": kredit_val,
+                "Saldo": saldo,
+                "_order": order,
+            })
+            order += 1
 
     pdf.close()
 
-    # Validasi Silang Saldo (Paksa Pembalik Debit/Kredit)
-    saldo_berjalan = 0.0
     for txn in transactions:
-        if txn["Saldo"] is not None and saldo_berjalan != 0.0:
-            expected = round(saldo_berjalan - txn["Debit"] + txn["Kredit"], 2)
-            if abs(expected - txn["Saldo"]) > 1.0:
-                # Coba tukar
-                expected_swap = round(saldo_berjalan + txn["Debit"] - txn["Kredit"], 2)
-                if abs(expected_swap - txn["Saldo"]) <= 1.0:
-                    txn["Debit"], txn["Kredit"] = txn["Kredit"], txn["Debit"]
-        
-        if txn["Saldo"] is not None:
-            saldo_berjalan = txn["Saldo"]
-
+        txn["Keterangan"] = re.sub(r"\bDB\b|\bCR\b", "", txn["Keterangan"]).strip()
         if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
         elif txn["Kredit"] > 0: txn["Tipe Asli"] = "CR"
         else: txn["Tipe Asli"] = "-"
@@ -153,11 +149,11 @@ def parse_maybank(file_bytes, password=None):
     return transactions
 
 # =========================================================
-# PARSER BCA (TIDAK DIUBAH, TETAP SAMA)
+# PARSER BCA (TETAP SAMA)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
-    # (Kode BCA tetap sama seperti sebelumnya karena sudah lumayan stabil)
+    # (Kode BCA tetap sama seperti sebelumnya)
     file_obj = BytesIO(file_bytes)
     pdf = open_pdf(file_obj, password)
     transactions = []
@@ -234,7 +230,6 @@ def parse_bca(file_bytes, password=None):
             transactions.append(current_txn)
             current_txn = None
     pdf.close()
-    # Validasi BCA
     saldo_berjalan = 0.0
     for txn in transactions:
         if txn["Saldo"] is None:
@@ -306,7 +301,7 @@ if uploaded_files:
         final_df = final_df.sort_values(["Tanggal_DT", "_order"]).reset_index(drop=True)
         final_df = final_df.drop(columns=["Tanggal_DT", "_order"])
 
-        st.subheader("📊 Preview Data (Bersih Total)")
+        st.subheader("📊 Preview Data (Bersih & Akurat)")
         st.dataframe(final_df, use_container_width=True)
 
         output = BytesIO()
@@ -316,6 +311,6 @@ if uploaded_files:
         st.download_button(
             "📥 Download Excel",
             data=output.getvalue(),
-            file_name="mutasi_bank_final_indo_fixed.xlsx",
+            file_name="mutasi_bank_final_fixed.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
