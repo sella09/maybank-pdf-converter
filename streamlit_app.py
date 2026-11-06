@@ -1,6 +1,5 @@
 import streamlit as st
 import pdfplumber
-import pypdf
 import pandas as pd
 import re
 import traceback
@@ -47,19 +46,16 @@ def clean_desc(text):
     return " ".join(str(text).split()).strip()
 
 # =========================================================
-# PARSER MAYBANK (MENGGUNAKAN Pypdf)
+# PARSER MAYBANK (PURE PDFPLUMBER)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_maybank(file_bytes, password=None):
     file_obj = BytesIO(file_bytes)
-    reader = pypdf.PdfReader(file_obj)
-    if password and reader.is_encrypted:
-        reader.decrypt(password)
-
+    pdf = open_pdf(file_obj, password)
     transactions = []
     order = 0
 
-    for page in reader.pages:
+    for page in pdf.pages:
         text = page.extract_text()
         if not text: continue
 
@@ -70,13 +66,21 @@ def parse_maybank(file_bytes, password=None):
             
             # Cari baris yang diawali tanggal (format DD/MM/YYYY)
             m_date = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(\d{4})\s+(.+)", line_str)
-            if not m_date: continue
+            if not m_date: 
+                # Terkadang ada spasi aneh, coba regex yang lebih longgar
+                m_date = re.search(r"(\d{2}/\d{2}/\d{4})\s+(\d{4})", line_str)
+                if not m_date: continue
+                
+                tgl = m_date.group(1)
+                kode = m_date.group(2)
+                rest = line_str[m_date.end():].strip()
+            else:
+                tgl = m_date.group(1)
+                kode = m_date.group(2)
+                rest = m_date.group(3)
 
-            tgl = m_date.group(1)
-            kode = m_date.group(2)
-            rest = m_date.group(3)
-
-            # Ekstrak angka (format: 150.000.000,00)
+            # Ekstrak HANYA angka dengan format desimal (contoh: 150.000.000,00)
+            # Ini memastikan tahun 2026 tidak terbaca
             nums_raw = re.findall(r"\b\d{1,3}(?:\.\d{3})*,\d{2}\b", rest)
             nums = [to_float(n) for n in nums_raw]
 
@@ -84,13 +88,14 @@ def parse_maybank(file_bytes, password=None):
             kredit_val = 0.0
             saldo = None
 
-            # LOGIKA 3 ANGKA DARI KANAN
+            # LOGIKA AMBIL 3 ANGKA DARI KANAN
             if len(nums) >= 3:
                 saldo = nums[-1]
                 kredit_val = nums[-2]
                 debit_val = nums[-3]
             elif len(nums) == 2:
                 saldo = nums[-1]
+                # Cek validasi saldo sebelumnya untuk tentukan Debit/Kredit
                 if len(transactions) > 0 and transactions[-1]["Saldo"] is not None:
                     prev = transactions[-1]["Saldo"]
                     if round(prev - nums[-2], 2) == round(saldo, 2):
@@ -115,6 +120,8 @@ def parse_maybank(file_bytes, password=None):
                 "_order": order,
             })
             order += 1
+
+    pdf.close()
 
     for txn in transactions:
         if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
