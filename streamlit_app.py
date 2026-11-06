@@ -46,7 +46,7 @@ def clean_desc(text):
     return " ".join(str(text).split()).strip()
 
 # =========================================================
-# PARSER MAYBANK (GRID TABEL PENUH)
+# PARSER MAYBANK (MURNI TEKS BARIS)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_maybank(file_bytes, password=None):
@@ -56,98 +56,88 @@ def parse_maybank(file_bytes, password=None):
     order = 0
 
     for page in pdf.pages:
-        # Ekstrak tabel dengan deteksi garis
-        tables = page.extract_tables({
-            "vertical_strategy": "lines", 
-            "horizontal_strategy": "lines"
-        })
-        
-        for table in tables:
-            for row in table:
-                if not row or len(row) < 5: continue
-                
-                # Cari Tanggal
-                tgl_match = None
-                for cell in row:
-                    if cell and re.match(r"^\d{2}/\d{2}/\d{4}$", str(cell).strip()):
-                        tgl_match = str(cell).strip()
-                        break
-                
-                if not tgl_match: continue
+        text = page.extract_text(layout=True)
+        if not text: continue
 
-                # Inisialisasi
-                kode = "-"
-                desc_parts = []
-                debit_val = 0.0
-                kredit_val = 0.0
-                saldo = None
+        lines = text.split("\n")
+        for line in lines:
+            line_str = line.strip()
+            if not line_str: continue
 
-                # Format PDF Maybank: [TGL, KODE, KETERANGAN, DEBIT, KREDIT, SALDO]
-                cells = [str(c).replace("\n", " ").strip() if c else "" for c in row]
+            # Abaikan header
+            if any(k in line_str.upper() for k in ["TGL KODE KETERANGAN", "TRANSAKSI REKENING GIRO"]):
+                continue
 
-                # Cari Kode
-                for c in cells:
-                    if re.match(r"^\d{4}$", c):
-                        kode = c
-                        break
-                
-                # Kumpulkan semua angka di sel
-                nums = []
-                for c in cells:
-                    found_nums = re.findall(r"\d[\d,.]*", c)
-                    for n in found_nums:
-                        nums.append(to_float(n))
+            # Cek apakah baris ini berisi tanggal (format 01/09/2026)
+            m_date = re.search(r"(\d{2}/\d{2}/\d{4})", line_str)
+            if not m_date: continue
 
-                # Tentukan Nominal (Ambil dari kanan)
-                # Karena ada 3 kolom uang (Debit, Kredit, Saldo) dan kadang ada yang kosong
-                if len(nums) >= 3:
-                    debit_val = nums[0]
-                    kredit_val = nums[1]
-                    saldo = nums[2]
-                elif len(nums) == 2:
-                    saldo = nums[1]
-                    # Cek selisih untuk menentukan Debit/Kredit
-                    if len(transactions) > 0 and transactions[-1]["Saldo"] is not None:
-                        prev = transactions[-1]["Saldo"]
-                        diff = round(prev - nums[0], 2)
-                        if diff == round(nums[1], 2):
-                            debit_val = nums[0]
-                        else:
-                            kredit_val = nums[0]
-                elif len(nums) == 1:
-                    saldo = nums[0]
+            tgl = m_date.group(1)
+            
+            # Hapus tanggal dari baris untuk mencari angka
+            clean_line = line_str.replace(tgl, "")
 
-                # Keterangan: Gabungkan teks yang bukan Tanggal, Kode, atau Angka murni
-                for c in cells:
-                    if c == tgl_match or c == kode: continue
-                    if re.match(r"^[\d,.\s]+$", c): continue # Skip jika isinya cuma angka
-                    desc_parts.append(c)
-                
-                desc_text = " ".join(desc_parts)
+            # Cari Kode (4 digit angka di awal baris)
+            m_kode = re.match(r"^\s*(\d{4})\s+", clean_line)
+            kode = m_kode.group(1) if m_kode else "-"
+            if m_kode:
+                clean_line = clean_line.replace(kode, "")
 
-                # VALIDASI MATEMATIKA (Kunci Pembalik)
-                if saldo is not None and len(transactions) > 0:
-                    prev_saldo = transactions[-1]["Saldo"]
-                    if prev_saldo is not None:
-                        if round(prev_saldo - debit_val, 2) == round(saldo, 2):
-                            kredit_val = 0.0
-                        elif round(prev_saldo + kredit_val, 2) == round(saldo, 2):
-                            debit_val = 0.0
-                        else:
-                            diff = round(prev_saldo - saldo, 2)
-                            if diff > 0: debit_val = diff
-                            else: kredit_val = abs(diff)
+            # Ekstrak HANYA angka desimal (contoh: 150.000.000,00 atau 150,000,000.00)
+            # Pola: minimal ada titik atau koma diikuti 2 digit di belakang
+            nums_raw = re.findall(r"\b\d{1,3}(?:[.,]\d{3})*[.,]\d{2}\b", clean_line)
+            nums = [to_float(n) for n in nums_raw]
 
-                transactions.append({
-                    "Tanggal": tgl_match,
-                    "Kode": kode,
-                    "Keterangan": clean_desc(desc_text),
-                    "Debit": debit_val,
-                    "Kredit": kredit_val,
-                    "Saldo": saldo,
-                    "_order": order,
-                })
-                order += 1
+            debit_val = 0.0
+            kredit_val = 0.0
+            saldo = None
+
+            # LOGIKA BACA DARI KANAN
+            if len(nums) >= 3:
+                saldo = nums[-1]
+                kredit_val = nums[-2]
+                debit_val = nums[-3]
+            elif len(nums) == 2:
+                saldo = nums[-1]
+                # Cek apakah selisihnya cocok untuk Debit atau Kredit
+                if len(transactions) > 0 and transactions[-1]["Saldo"] is not None:
+                    prev = transactions[-1]["Saldo"]
+                    if round(prev - nums[-2], 2) == round(saldo, 2):
+                        debit_val = nums[-2]
+                    else:
+                        kredit_val = nums[-2]
+            elif len(nums) == 1:
+                saldo = nums[0]
+
+            # Keterangan: Hapus angka dari baris
+            desc_text = clean_line
+            for n in nums_raw:
+                desc_text = desc_text.replace(n, "")
+            desc_text = re.sub(r"\bDEBIT\b|\bKREDIT\b|\bSALDO\b", "", desc_text, flags=re.I)
+            
+            # Validasi Akhir
+            if saldo is not None and len(transactions) > 0:
+                prev_saldo = transactions[-1]["Saldo"]
+                if prev_saldo is not None:
+                    if round(prev_saldo - debit_val, 2) == round(saldo, 2):
+                        kredit_val = 0.0
+                    elif round(prev_saldo + kredit_val, 2) == round(saldo, 2):
+                        debit_val = 0.0
+                    else:
+                        diff = round(prev_saldo - saldo, 2)
+                        if diff > 0: debit_val = diff
+                        else: kredit_val = abs(diff)
+
+            transactions.append({
+                "Tanggal": tgl,
+                "Kode": kode,
+                "Keterangan": clean_desc(desc_text),
+                "Debit": debit_val,
+                "Kredit": kredit_val,
+                "Saldo": saldo,
+                "_order": order,
+            })
+            order += 1
 
     pdf.close()
 
@@ -159,7 +149,7 @@ def parse_maybank(file_bytes, password=None):
     return transactions
 
 # =========================================================
-# PARSER BCA (TETAP)
+# PARSER BCA (TETAP SAMA)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
