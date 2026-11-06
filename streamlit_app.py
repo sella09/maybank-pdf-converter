@@ -44,14 +44,132 @@ def to_float(num_str):
 def clean_desc(text):
     if not text: return ""
     t = str(text)
-    t = re.sub(r"Bersambung ke halaman berikut\.?", "", t, flags=re.I)
-    t = re.sub(r"SALDO\s+AWAL\s*:.*?(SALDO\s+AKHIR\s*:.*)?", "", t, flags=re.I)
-    t = re.sub(r"CATATAN\s*:.*?Rekening\.?", "", t, flags=re.I | re.S)
-    t = re.sub(r"HALAMAN\s*:.*?IDR", "", t, flags=re.I)
     return " ".join(t.split()).strip()
 
 # =========================================================
-# PARSER BCA (LAYOUT TEXT)
+# PARSER MAYBANK (POSISI KOLOM X)
+# =========================================================
+@st.cache_data(show_spinner=False)
+def parse_maybank(file_bytes, password=None):
+    file_obj = BytesIO(file_bytes)
+    pdf = open_pdf(file_obj, password)
+    transactions = []
+    order = 0
+
+    for page in pdf.pages:
+        words = page.extract_words()
+        
+        # Kelompokkan per baris (Y)
+        lines = {}
+        for w in words:
+            y = round(w['top'], 1)
+            if y not in lines: lines[y] = []
+            lines[y].append(w)
+
+        current_txn = None
+
+        for y in sorted(lines.keys()):
+            row = sorted(lines[y], key=lambda w: w['x0'])
+            row_text = " ".join([w['text'] for w in row])
+
+            # Abaikan header
+            if any(k in row_text.upper() for k in ["TGL KODE KETERANGAN", "TRANSAKSI REKENING GIRO"]):
+                continue
+
+            # Cek tanggal (format 01/09/2026)
+            m_date = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(.+)", row_text)
+            
+            if m_date:
+                if current_txn:
+                    transactions.append(current_txn)
+
+                tgl = m_date.group(1)
+                rest_text = m_date.group(2)
+
+                # Pisahkan berdasarkan X (Kolom)
+                # Asumsi X: Tgl < 50, Kode < 100, Keterangan < 400, Debit < 500, Kredit < 600, Saldo > 600
+                desc_parts = []
+                debit_val = 0.0
+                kredit_val = 0.0
+                saldo = None
+                
+                for w in row:
+                    txt = w['text']
+                    x = w['x0']
+                    
+                    if re.match(r"^\d[\d,.]*$", txt) and x > 350:
+                        val = to_float(txt)
+                        if x > 600:   # Kolom Saldo
+                            saldo = val
+                        elif x > 480: # Kolom Kredit
+                            kredit_val = val
+                        elif x > 350: # Kolom Debit
+                            debit_val = val
+                    else:
+                        if x < 350:   # Kolom Keterangan
+                            desc_parts.append(txt)
+                
+                # Bersihkan teks keterangan
+                desc_text = " ".join(desc_parts)
+                desc_text = re.sub(r"\b\d{2}/\d{2}/\d{4}\b", "", desc_text) # hapus sisa tanggal
+                
+                # VALIDASI MATEMATIKA UNTUK MEMASTIKAN DEBIT/KREDIT BENAR
+                if saldo is not None and len(transactions) > 0:
+                    prev_saldo = transactions[-1]["Saldo"]
+                    if prev_saldo is not None:
+                        # Jika Debit > 0 tapi secara hitungan harusnya Kredit
+                        if debit_val > 0 and round(prev_saldo + debit_val, 2) == round(saldo, 2):
+                            kredit_val = debit_val
+                            debit_val = 0.0
+                        # Jika Kredit > 0 tapi secara hitungan harusnya Debit
+                        elif kredit_val > 0 and round(prev_saldo - kredit_val, 2) == round(saldo, 2):
+                            debit_val = kredit_val
+                            kredit_val = 0.0
+
+                current_txn = {
+                    "Tanggal": tgl,
+                    "Kode": "-",
+                    "Keterangan": clean_desc(desc_text),
+                    "Debit": debit_val,
+                    "Kredit": kredit_val,
+                    "Saldo": saldo,
+                    "_order": order,
+                }
+                order += 1
+                
+            else:
+                # Baris lanjutan keterangan
+                if current_txn:
+                    # Cek jika ada angka nyasar di baris ini
+                    for w in row:
+                        txt = w['text']
+                        x = w['x0']
+                        if re.match(r"^\d[\d,.]*$", txt) and x > 350:
+                            val = to_float(txt)
+                            if x > 600 and current_txn["Saldo"] is None: current_txn["Saldo"] = val
+                            elif x > 480 and current_txn["Kredit"] == 0: current_txn["Kredit"] = val
+                            elif x > 350 and current_txn["Debit"] == 0: current_txn["Debit"] = val
+                        else:
+                            if x < 350:
+                                current_txn["Keterangan"] += " " + txt
+
+        if current_txn:
+            transactions.append(current_txn)
+            current_txn = None
+
+    pdf.close()
+
+    # Pembersihan Akhir
+    for txn in transactions:
+        txn["Keterangan"] = clean_desc(txn["Keterangan"])
+        if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
+        elif txn["Kredit"] > 0: txn["Tipe Asli"] = "CR"
+        else: txn["Tipe Asli"] = "-"
+
+    return transactions
+
+# =========================================================
+# PARSER BCA (TETAP SEPERTI SEBELUMNYA)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def parse_bca(file_bytes, password=None):
@@ -180,109 +298,6 @@ def parse_bca(file_bytes, password=None):
     return transactions
 
 # =========================================================
-# PARSER MAYBANK (TABEL GRID)
-# =========================================================
-@st.cache_data(show_spinner=False)
-def parse_maybank(file_bytes, password=None):
-    file_obj = BytesIO(file_bytes)
-    pdf = open_pdf(file_obj, password)
-    transactions = []
-    order = 0
-
-    for page in pdf.pages:
-        # Baca tabel langsung
-        tables = page.extract_tables({
-            "vertical_strategy": "lines", 
-            "horizontal_strategy": "lines"
-        })
-        
-        # Jika tidak ada garis tabel, coba mode teks
-        if not tables:
-            tables = page.extract_tables({
-                "vertical_strategy": "text", 
-                "horizontal_strategy": "text"
-            })
-
-        for table in tables:
-            for row in table:
-                if not row or len(row) < 4: continue
-                
-                # Cari tanggal (format 01/09/2026)
-                tgl_match = None
-                for cell in row:
-                    if cell and re.match(r"^\d{2}/\d{2}/\d{4}$", str(cell).strip()):
-                        tgl_match = str(cell).strip()
-                        break
-                
-                if not tgl_match: continue
-
-                # Ambil semua angka desimal di baris
-                full_text = " ".join([str(c).replace("\n", " ") for c in row if c])
-                nums = re.findall(r"\d[\d,]*\.\d{2}", full_text)
-                parsed_nums = [to_float(n) for n in nums]
-
-                if len(parsed_nums) >= 2:
-                    nominal = parsed_nums[0]
-                    saldo = parsed_nums[-1]
-                elif len(parsed_nums) == 1:
-                    nominal = parsed_nums[0]
-                    saldo = None
-                else:
-                    nominal = 0.0
-                    saldo = None
-
-                # Bersihkan Teks Keterangan (Gabungkan semua sel kecuali tanggal)
-                desc_text = full_text.replace(tgl_match, "")
-                for n in nums:
-                    desc_text = desc_text.replace(n, "")
-                
-                # Cek Debit/Kredit
-                is_db = False
-                if "DEBIT" in full_text.upper() and "KREDIT" in full_text.upper():
-                    # Jika ada judul DEBIT dan KREDIT, cek posisi selnya
-                    pass
-
-                # Keterangan default
-                current_txn = {
-                    "Tanggal": tgl_match,
-                    "Kode": "-",
-                    "Keterangan": clean_desc(desc_text),
-                    "Debit": nominal if is_db else 0.0,
-                    "Kredit": nominal if not is_db else 0.0,
-                    "Saldo": saldo,
-                    "_order": order,
-                }
-                
-                # Deteksi Debit/Kredit dengan validasi Saldo
-                if saldo is not None and len(transactions) > 0:
-                    prev_saldo = transactions[-1]["Saldo"]
-                    if prev_saldo is not None:
-                        # Cek apakah masuk Debit atau Kredit
-                        if round(prev_saldo - nominal, 2) == round(saldo, 2):
-                            current_txn["Debit"] = nominal
-                            current_txn["Kredit"] = 0.0
-                        elif round(prev_saldo + nominal, 2) == round(saldo, 2):
-                            current_txn["Debit"] = 0.0
-                            current_txn["Kredit"] = nominal
-
-                transactions.append(current_txn)
-                order += 1
-
-    pdf.close()
-
-    # Pembersihan Akhir
-    for txn in transactions:
-        txn["Keterangan"] = clean_desc(txn["Keterangan"])
-        txn["Keterangan"] = re.sub(r"\b\d{2}/\d{2}/\d{4}\b", "", txn["Keterangan"]).strip()
-        txn["Keterangan"] = " ".join(txn["Keterangan"].split())
-
-        if txn["Debit"] > 0: txn["Tipe Asli"] = "DB"
-        elif txn["Kredit"] > 0: txn["Tipe Asli"] = "CR"
-        else: txn["Tipe Asli"] = "-"
-
-    return transactions
-
-# =========================================================
 # UI STREAMLIT
 # =========================================================
 col1, col2, col3 = st.columns(3)
@@ -343,6 +358,6 @@ if uploaded_files:
         st.download_button(
             "📥 Download Excel",
             data=output.getvalue(),
-            file_name="mutasi_bank_fixed_indo.xlsx",
+            file_name="mutasi_bank_final_indo_fixed.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
